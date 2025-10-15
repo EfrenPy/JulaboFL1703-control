@@ -20,7 +20,7 @@ operations.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import serial
 from serial.tools import list_ports
@@ -133,7 +133,11 @@ class JulaboChiller:
     def set_setpoint(self, value: float) -> None:
         """Update the temperature setpoint."""
 
-        self._query(f"out_sp_00 {value:.1f}")
+        # ``out_`` commands issued to the Julabo do not generate a reply.  The
+        # controller silently applies the requested change, meaning waiting for a
+        # response would time out.  Send the command and then explicitly read the
+        # setpoint back to confirm it was applied.
+        self._write(f"out_sp_00 {value:.1f}")
 
         # Read the setpoint back from the controller to confirm it has been
         # applied.  The device echoes the setpoint with one decimal place, so
@@ -156,7 +160,9 @@ class JulaboChiller:
         """Start or stop the circulation pump and confirm the new state."""
 
         value = 1 if start else 0
-        self._query(f"out_mode_05 {value}")
+        # ``out_`` commands do not send a response, so only issue the write and
+        # rely on a follow-up ``in_`` command to confirm the change.
+        self._write(f"out_mode_05 {value}")
 
         confirmed = self.is_running()
         if confirmed != start:
@@ -296,9 +302,13 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     error dialog to inform the user.
     """
 
+    import time
     import tkinter as tk
     from tkinter import messagebox
     from tkinter import font as tkfont
+
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
 
     chiller: Optional[JulaboChiller] = None
     refresh_job: Optional[str] = None
@@ -341,6 +351,52 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     status_var = tk.StringVar()
     running_var = tk.BooleanVar(value=False)
 
+    temperature_history: List[Tuple[float, float]] = []
+    max_history_points = 120
+    axes = None
+    canvas = None
+    temperature_line = None
+
+    def clear_temperature_plot() -> None:
+        temperature_history.clear()
+        if axes is None or canvas is None or temperature_line is None:
+            return
+        temperature_line.set_data([], [])
+        axes.set_xlim(0.0, 1.0)
+        axes.set_ylim(0.0, 1.0)
+        canvas.draw_idle()
+
+    def update_temperature_plot() -> None:
+        if not temperature_history or axes is None or canvas is None or temperature_line is None:
+            return
+
+        times, temps = zip(*temperature_history)
+        start_time = times[0]
+        elapsed_minutes = [(timestamp - start_time) / 60 for timestamp in times]
+        temperature_line.set_data(elapsed_minutes, temps)
+
+        if len(elapsed_minutes) == 1 or elapsed_minutes[-1] == 0:
+            x_max = 1.0
+        else:
+            x_max = elapsed_minutes[-1]
+        axes.set_xlim(0.0, max(x_max, 1.0))
+
+        temp_min = min(temps)
+        temp_max = max(temps)
+        if temp_min == temp_max:
+            padding = max(0.5, abs(temp_min) * 0.05)
+        else:
+            padding = (temp_max - temp_min) * 0.1
+        axes.set_ylim(temp_min - padding, temp_max + padding)
+
+        canvas.draw_idle()
+
+    def record_temperature(value: float) -> None:
+        temperature_history.append((time.time(), value))
+        if len(temperature_history) > max_history_points:
+            del temperature_history[:-max_history_points]
+        update_temperature_plot()
+
     def cancel_refresh() -> None:
         nonlocal refresh_job
         if refresh_job is not None:
@@ -356,6 +412,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         if chiller is None:
             status_var.set("Not connected to Julabo chiller.")
             running_var.set(False)
+            clear_temperature_plot()
             return
 
         try:
@@ -370,6 +427,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             running_var.set(running)
             update_running_button()
             status_var.set("")
+            record_temperature(temperature)
         finally:
             if chiller is not None and root.winfo_exists():
                 refresh_job = root.after(5000, refresh_readings)
@@ -398,6 +456,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
         cancel_refresh()
         chiller = new_chiller
+        clear_temperature_plot()
 
         if new_settings is not None:
             timeout_value = new_settings.timeout
@@ -487,6 +546,11 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     main_frame = tk.Frame(root, padx=20, pady=20)
     main_frame.pack(fill=tk.BOTH, expand=True)
 
+    main_frame.grid_columnconfigure(0, weight=1)
+    main_frame.grid_columnconfigure(1, weight=1)
+    main_frame.grid_columnconfigure(2, weight=1)
+    main_frame.grid_rowconfigure(6, weight=1)
+
     tk.Label(main_frame, text="Serial port:").grid(row=0, column=0, sticky=tk.W)
     port_entry = tk.Entry(main_frame, textvariable=port_var, width=20)
     port_entry.grid(row=0, column=1, sticky=tk.W)
@@ -512,6 +576,23 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     status_label = tk.Label(main_frame, textvariable=status_var, fg="red")
     status_label.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+
+    plot_frame = tk.LabelFrame(main_frame, text="Temperature trend", padx=10, pady=10)
+    plot_frame.grid(row=6, column=0, columnspan=3, sticky=tk.NSEW, pady=(10, 0))
+
+    figure = Figure(figsize=(6, 3), dpi=100)
+    axes = figure.add_subplot(111)
+    axes.set_xlabel("Time (min)")
+    axes.set_ylabel("Temperature (°C)")
+    axes.grid(True, linestyle="--", linewidth=0.5)
+    (temperature_line,) = axes.plot([], [], marker="o", linestyle="-", color="#1f77b4")
+    figure.tight_layout()
+
+    canvas = FigureCanvasTkAgg(figure, master=plot_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    clear_temperature_plot()
 
     for child in main_frame.winfo_children():
         child.grid_configure(padx=4, pady=4)
