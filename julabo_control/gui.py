@@ -98,11 +98,14 @@ def run_gui(
         else:
             toggle_button.configure(text="Start machine")
 
-    def set_connected(new_chiller: Optional[JulaboChiller], new_settings: Optional[SerialSettings]) -> None:
+    def set_connected(
+        new_chiller: Optional[JulaboChiller], new_settings: Optional[SerialSettings]
+    ) -> None:
         nonlocal chiller
         cancel_refresh()
-        if chiller is not None:
-            chiller.close()
+        previous = chiller
+        if previous is not None and previous is not new_chiller:
+            previous.close()
         chiller = new_chiller
         if new_chiller is not None and new_settings is not None:
             remember_port(new_settings.port)
