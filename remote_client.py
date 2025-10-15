@@ -1,5 +1,4 @@
 """GUI client for remotely controlling a Julabo chiller."""
-from __future__ import annotations
 
 import argparse
 import json
