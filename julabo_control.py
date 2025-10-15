@@ -434,7 +434,6 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             temp_var.set(f"{temperature:.2f} °C")
             running_var.set(running)
             update_running_button()
-            status_var.set("")
             record_temperature(temperature)
         finally:
             if chiller is not None and root.winfo_exists():
@@ -544,7 +543,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             update_running_button()
             show_status(
                 "Machine started" if confirmed else "Machine stopped",
-                color="green",
+                color="green" if confirmed else "red",
             )
 
     def on_close() -> None:
