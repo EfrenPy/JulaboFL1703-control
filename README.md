@@ -23,7 +23,8 @@ recirculating chiller via RS232.
 ## Running the CLI
 
 The tool can automatically probe USB serial adapters until it finds the
-Julabo controller. Simply run one of the following commands:
+Julabo controller. This works on Linux (``/dev/ttyUSB0`` style paths) and on
+Windows (``COM3`` style names). Simply run one of the following commands:
 
 ```bash
 python -m julabo_control version
@@ -32,7 +33,7 @@ python -m julabo_control set-setpoint 18.5
 python -m julabo_control start
 ```
 
-You can still pass `--port /dev/ttyUSB0` (or another path) to override the
+You can still pass `--port /dev/ttyUSB0` (or `--port COM3` on Windows) to override the
 auto-detected device. The last working port is cached in
 `~/.julabo_control_port` so subsequent runs, including the GUI, connect
 instantly without additional prompts.
@@ -90,12 +91,16 @@ GUI client.
 1. Start the server on the machine that has the serial connection:
 
    ```bash
-   python remote_control_server.py /dev/ttyUSB0 --host 0.0.0.0 --port 8765
+   python remote_control_server.py --host 0.0.0.0 --port 8765
    ```
 
-   Replace `/dev/ttyUSB0` with the correct serial device path. The server
-   stays connected to the chiller and listens for JSON commands over the
-   configured TCP socket.
+   The program automatically scans local serial ports, covering both
+   `/dev/ttyUSB0` style paths on Linux and `COM` style device names on
+   Windows. If no Julabo controller is found it keeps retrying every few
+   seconds until the adapter appears. Pass an explicit port (for example
+   `python remote_control_server.py COM3`) if you prefer to override the
+   auto-detected adapter. The server stays connected to the chiller and listens
+   for JSON commands over the configured TCP socket.
 
 2. On another computer, run the GUI client and point it to the server:
 

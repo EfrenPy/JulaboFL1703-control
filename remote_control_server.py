@@ -7,12 +7,24 @@ import logging
 import signal
 import socketserver
 import threading
+import time
 from typing import Any, Dict, Tuple
 
-from julabo_control import DEFAULT_BAUDRATE, DEFAULT_TIMEOUT, JulaboChiller, SerialSettings
+import serial
+
+from julabo_control import (
+    DEFAULT_BAUDRATE,
+    DEFAULT_TIMEOUT,
+    JulaboChiller,
+    JulaboError,
+    SerialSettings,
+    auto_detect_port,
+)
 
 
 LOGGER = logging.getLogger(__name__)
+
+RETRY_DELAY = 5.0
 
 
 class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -84,7 +96,14 @@ class JulaboRequestHandler(socketserver.StreamRequestHandler):
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("serial_port", help="Serial port path for the Julabo chiller")
+    parser.add_argument(
+        "serial_port",
+        nargs="?",
+        help=(
+            "Serial port path for the Julabo chiller. If omitted the server tries "
+            "to auto-detect the adapter."
+        ),
+    )
     parser.add_argument(
         "--host",
         default="0.0.0.0",
@@ -122,14 +141,45 @@ def main() -> None:  # pragma: no cover - CLI helper
     args = parse_arguments()
     configure_logging(args.verbose)
 
-    settings = SerialSettings(
-        port=args.serial_port,
-        baudrate=args.baudrate,
-        timeout=args.timeout,
-    )
+    chiller: JulaboChiller
+    while True:
+        if args.serial_port:
+            serial_port = args.serial_port
+            LOGGER.info("Using configured Julabo serial port %s", serial_port)
+        else:
+            try:
+                serial_port = auto_detect_port(args.timeout)
+            except serial.SerialException as exc:
+                LOGGER.warning(
+                    "Unable to locate Julabo chiller automatically: %s. "
+                    "Retrying in %.1f seconds...",
+                    exc,
+                    RETRY_DELAY,
+                )
+                time.sleep(RETRY_DELAY)
+                continue
+            LOGGER.info("Auto-detected Julabo serial port at %s", serial_port)
 
-    chiller = JulaboChiller(settings)
-    chiller.connect()
+        settings = SerialSettings(
+            port=serial_port,
+            baudrate=args.baudrate,
+            timeout=args.timeout,
+        )
+
+        chiller = JulaboChiller(settings)
+        try:
+            chiller.connect()
+            chiller.identify()
+        except (JulaboError, TimeoutError, serial.SerialException) as exc:
+            chiller.close()
+            LOGGER.error("Failed to connect to Julabo on %s: %s", serial_port, exc)
+            if args.serial_port:
+                raise SystemExit(2) from exc
+            LOGGER.info("Will retry detection in %.1f seconds", RETRY_DELAY)
+            time.sleep(RETRY_DELAY)
+            continue
+
+        break
 
     server = JulaboTCPServer((args.host, args.port), chiller)
     LOGGER.info("Listening on %s:%s", args.host, args.port)
