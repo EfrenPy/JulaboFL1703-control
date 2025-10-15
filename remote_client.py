@@ -69,12 +69,8 @@ class RemoteChillerApp:
         self.setpoint_var = tk.StringVar(value="-- °C")
         self.running_var = tk.BooleanVar(value=False)
         self.message_var = tk.StringVar(value="")
-        self.message_label: Optional[tk.Label] = None
         self.temperature_history: List[Tuple[float, float]] = []
-        self._history_retention_seconds = 12 * 60 * 60  # keep 12 hours of readings
-        self._time_window_minutes = 5.0
-        self.slider_var = tk.DoubleVar(master=self.root, value=0.0)
-        self.timeline_slider: Optional[tk.Scale] = None
+        self._max_history_points = 120
 
         self._build_layout()
         self._set_message("", color="black")
@@ -148,6 +144,22 @@ class RemoteChillerApp:
             command=self._on_slider_change,
         )
         self.timeline_slider.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        plot_frame = tk.LabelFrame(frame, text="Temperature Trend", padx=10, pady=10)
+        plot_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        frame.rowconfigure(6, weight=1)
+
+        self.figure = Figure(figsize=(6, 3), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        self.axes.set_xlabel("Time (min)")
+        self.axes.set_ylabel("Temperature (°C)")
+        self.axes.grid(True, linestyle="--", linewidth=0.5)
+        (self.temperature_line,) = self.axes.plot([], [], marker="o", linestyle="-", color="#1f77b4")
+        self.figure.tight_layout()
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
         for child in frame.winfo_children():
             child.grid_configure(padx=4, pady=4)
@@ -304,6 +316,38 @@ class RemoteChillerApp:
 
         temp_min = min(window_temps)
         temp_max = max(window_temps)
+        if temp_min == temp_max:
+            padding = max(0.5, abs(temp_min) * 0.05)
+        else:
+            padding = (temp_max - temp_min) * 0.1
+        self.axes.set_ylim(temp_min - padding, temp_max + padding)
+
+        self.axes.figure.canvas.draw_idle()
+
+    def _record_temperature(self, value: float) -> None:
+        timestamp = time.time()
+        self.temperature_history.append((timestamp, value))
+        if len(self.temperature_history) > self._max_history_points:
+            self.temperature_history = self.temperature_history[-self._max_history_points :]
+        self._update_temperature_plot()
+
+    def _update_temperature_plot(self) -> None:
+        if not self.temperature_history:
+            return
+
+        times, temps = zip(*self.temperature_history)
+        start_time = times[0]
+        elapsed_minutes = [(t - start_time) / 60 for t in times]
+        self.temperature_line.set_data(elapsed_minutes, temps)
+
+        if len(elapsed_minutes) == 1 or elapsed_minutes[-1] == 0:
+            x_max = 1.0
+        else:
+            x_max = elapsed_minutes[-1]
+        self.axes.set_xlim(0.0, max(x_max, 1.0))
+
+        temp_min = min(temps)
+        temp_max = max(temps)
         if temp_min == temp_max:
             padding = max(0.5, abs(temp_min) * 0.05)
         else:
