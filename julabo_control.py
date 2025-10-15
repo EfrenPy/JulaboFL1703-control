@@ -246,25 +246,36 @@ def auto_detect_port(timeout: float) -> str:
     )
 
 
-def run_gui(settings: SerialSettings) -> None:
-    """Launch a small Tk GUI for interactive temperature control."""
+def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseException] = None) -> None:
+    """Launch a small Tk GUI for interactive temperature control.
+
+    ``settings`` may be ``None`` when no serial port could be determined. In
+    that case the GUI is still shown but remains disconnected and displays an
+    error dialog to inform the user.
+    """
 
     import tkinter as tk
     from tkinter import messagebox
 
-    chiller = JulaboChiller(settings)
+    chiller: Optional[JulaboChiller] = None
 
     root = tk.Tk()
     root.title("Julabo Chiller Control")
 
-    try:
-        chiller.connect()
-    except Exception as exc:  # pragma: no cover - GUI runtime feedback
-        messagebox.showerror("Connection error", str(exc))
-        root.destroy()
-        return
-    else:
-        _remember_port(settings.port)
+    connection_error = startup_error
+
+    if settings is not None and connection_error is None:
+        chiller = JulaboChiller(settings)
+        try:
+            chiller.connect()
+        except Exception as exc:  # pragma: no cover - GUI runtime feedback
+            connection_error = exc
+            chiller = None
+        else:
+            _remember_port(settings.port)
+
+    if connection_error is not None:  # pragma: no cover - GUI runtime feedback
+        messagebox.showerror("Connection error", str(connection_error))
 
     entry_var = tk.StringVar()
     setpoint_var = tk.StringVar(value="--")
@@ -272,6 +283,10 @@ def run_gui(settings: SerialSettings) -> None:
     status_var = tk.StringVar()
 
     def refresh_readings() -> None:
+        if chiller is None:
+            status_var.set("Not connected to Julabo chiller.")
+            return
+
         try:
             setpoint = chiller.get_setpoint()
             temperature = chiller.get_temperature()
@@ -290,6 +305,11 @@ def run_gui(settings: SerialSettings) -> None:
         if not raw_value:
             status_var.set("Enter a temperature first.")
             return
+
+        if chiller is None:
+            status_var.set("Not connected to Julabo chiller.")
+            return
+
         try:
             value = float(raw_value)
         except ValueError:
@@ -305,7 +325,8 @@ def run_gui(settings: SerialSettings) -> None:
             entry_var.set("")
 
     def on_close() -> None:
-        chiller.close()
+        if chiller is not None:
+            chiller.close()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -333,11 +354,18 @@ def run_gui(settings: SerialSettings) -> None:
     for child in main_frame.winfo_children():
         child.grid_configure(padx=4, pady=4)
 
-    refresh_readings()
+    if chiller is not None:
+        refresh_readings()
+    else:
+        entry.configure(state="disabled")
+        button.configure(state="disabled")
+        status_var.set("Connect the Julabo chiller and restart the GUI.")
+
     try:
         root.mainloop()
     finally:
-        chiller.close()
+        if chiller is not None:
+            chiller.close()
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -378,6 +406,19 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.command == "gui":
+        if args.port:
+            run_gui(SerialSettings(port=args.port, timeout=args.timeout))
+            return 0
+        try:
+            port = auto_detect_port(args.timeout)
+        except serial.SerialException as exc:
+            run_gui(None, startup_error=exc)
+            return 2
+        else:
+            run_gui(SerialSettings(port=port, timeout=args.timeout))
+            return 0
+
     port = args.port or auto_detect_port(args.timeout)
     settings = SerialSettings(port=port, timeout=args.timeout)
 
@@ -409,10 +450,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 raise AssertionError(f"Unknown command: {args.command}")
 
     try:
-        if args.command == "gui":
-            run_gui(settings)
-        else:
-            print(_format_lines(run()))
+        print(_format_lines(run()))
         return 0
     except (JulaboError, TimeoutError, serial.SerialException) as exc:
         parser.error(str(exc))
