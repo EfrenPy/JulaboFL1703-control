@@ -5,7 +5,7 @@ recirculating chiller via RS232.
 
 ## Requirements
 
-* Python 3.9+
+* Python 3.8+
 * [`pyserial`](https://pyserial.readthedocs.io/en/latest/) (`pip install pyserial`)
 * Null-modem cable and RS232-to-USB converter connected to the chiller
 
