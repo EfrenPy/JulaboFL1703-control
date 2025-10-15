@@ -4,6 +4,7 @@ import argparse
 import json
 import socket
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox
 from typing import Any, Dict, Optional
 
@@ -43,17 +44,31 @@ class RemoteChillerApp:
         self.client = client
 
         root.title("Julabo Remote Control")
-        root.resizable(False, False)
 
-        self.status_var = tk.StringVar(value="Unknown")
-        self.temperature_var = tk.StringVar(value="Unknown")
-        self.setpoint_var = tk.StringVar(value="Unknown")
+        for font_name in (
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkFixedFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkTooltipFont",
+        ):
+            try:
+                tkfont.nametofont(font_name).configure(size=12)
+            except tk.TclError:
+                pass
+
+        self.status_var = tk.StringVar(value="--")
+        self.temperature_var = tk.StringVar(value="-- °C")
+        self.setpoint_var = tk.StringVar(value="-- °C")
+        self.running_var = tk.BooleanVar(value=False)
+        self.message_var = tk.StringVar(value="")
 
         self._build_layout()
         self.refresh_status()
 
     def _build_layout(self) -> None:
-        frame = tk.Frame(self.root, padx=10, pady=10)
+        frame = tk.Frame(self.root, padx=20, pady=20)
         frame.grid(row=0, column=0, sticky="nsew")
 
         tk.Label(frame, text="Status:").grid(row=0, column=0, sticky="w")
@@ -65,24 +80,49 @@ class RemoteChillerApp:
         tk.Label(frame, text="Setpoint (°C):").grid(row=2, column=0, sticky="w")
         tk.Label(frame, textvariable=self.setpoint_var, width=20).grid(row=2, column=1, sticky="w")
 
+        tk.Label(frame, text="Cooling:").grid(row=3, column=0, sticky="w")
+        self.running_text_var = tk.StringVar(value="Stopped")
+        tk.Label(frame, textvariable=self.running_text_var, width=20).grid(row=3, column=1, sticky="w")
+
         control_frame = tk.LabelFrame(frame, text="Controls", padx=10, pady=10)
-        control_frame.grid(row=3, column=0, columnspan=2, pady=(10, 0), sticky="ew")
+        control_frame.grid(row=4, column=0, columnspan=2, pady=(10, 0), sticky="ew")
 
         tk.Button(control_frame, text="Refresh", command=self.refresh_status).grid(row=0, column=0, padx=5)
-        tk.Button(control_frame, text="Start", command=lambda: self._execute("start")).grid(row=0, column=1, padx=5)
-        tk.Button(control_frame, text="Stop", command=lambda: self._execute("stop")).grid(row=0, column=2, padx=5)
+        self.toggle_button = tk.Button(control_frame, text="Start cooling", command=self._toggle_running)
+        self.toggle_button.grid(row=0, column=1, padx=5)
 
         tk.Label(control_frame, text="Set new setpoint:").grid(row=1, column=0, sticky="e", pady=(10, 0))
         self.new_setpoint_entry = tk.Entry(control_frame, width=10)
         self.new_setpoint_entry.grid(row=1, column=1, pady=(10, 0))
         tk.Button(control_frame, text="Apply", command=self._apply_setpoint).grid(row=1, column=2, padx=5, pady=(10, 0))
 
-    def _execute(self, command: str) -> None:
+        tk.Label(frame, textvariable=self.message_var, fg="red").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(12, 0)
+        )
+
+        for child in frame.winfo_children():
+            child.grid_configure(padx=4, pady=4)
+
+        self._update_running_state()
+
+    def _update_running_state(self) -> None:
+        self.running_text_var.set("Running" if self.running_var.get() else "Stopped")
+        self.toggle_button.configure(
+            text="Stop cooling" if self.running_var.get() else "Start cooling"
+        )
+
+    def _toggle_running(self) -> None:
+        target_state = not self.running_var.get()
+        command = "start" if target_state else "stop"
         try:
-            self.client.command(command)
-            self.refresh_status()
+            confirmed = bool(self.client.command(command))
         except Exception as exc:  # pylint: disable=broad-except
-            messagebox.showerror("Command failed", str(exc))
+            messagebox.showerror("Cooling control error", str(exc))
+            self.message_var.set(f"Error: {exc}")
+            return
+
+        self.refresh_status(clear_message=False)
+        self.message_var.set("Cooling started" if confirmed else "Cooling stopped")
 
     def _apply_setpoint(self) -> None:
         try:
@@ -92,23 +132,34 @@ class RemoteChillerApp:
             return
 
         try:
-            self.client.command("set_setpoint", value)
-            self.refresh_status()
+            confirmed = float(self.client.command("set_setpoint", value))
         except Exception as exc:  # pylint: disable=broad-except
             messagebox.showerror("Setpoint error", str(exc))
+            self.message_var.set(f"Error: {exc}")
+            return
 
-    def refresh_status(self) -> None:
+        self.new_setpoint_entry.delete(0, tk.END)
+        self.refresh_status(clear_message=False)
+        self.message_var.set(f"Setpoint updated to {confirmed:.2f} °C")
+
+    def refresh_status(self, *, clear_message: bool = True) -> None:
         try:
             status = self.client.command("status")
             temperature = self.client.command("temperature")
             setpoint = self.client.command("get_setpoint")
+            running = bool(self.client.command("is_running"))
         except Exception as exc:  # pylint: disable=broad-except
             messagebox.showerror("Connection error", str(exc))
+            self.message_var.set(f"Error: {exc}")
             return
 
         self.status_var.set(status)
-        self.temperature_var.set(f"{float(temperature):.2f}")
-        self.setpoint_var.set(f"{float(setpoint):.2f}")
+        self.temperature_var.set(f"{float(temperature):.2f} °C")
+        self.setpoint_var.set(f"{float(setpoint):.2f} °C")
+        self.running_var.set(running)
+        self._update_running_state()
+        if clear_message:
+            self.message_var.set("")
 
 
 def parse_args() -> argparse.Namespace:
