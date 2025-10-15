@@ -3,10 +3,14 @@
 import argparse
 import json
 import socket
+import time
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 
 class RemoteChillerClient:
@@ -44,6 +48,8 @@ class RemoteChillerApp:
         self.client = client
 
         root.title("Julabo Remote Control")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
         for font_name in (
             "TkDefaultFont",
@@ -63,6 +69,8 @@ class RemoteChillerApp:
         self.setpoint_var = tk.StringVar(value="-- °C")
         self.running_var = tk.BooleanVar(value=False)
         self.message_var = tk.StringVar(value="")
+        self.temperature_history: List[Tuple[float, float]] = []
+        self._max_history_points = 120
 
         self._build_layout()
         self.refresh_status()
@@ -70,6 +78,8 @@ class RemoteChillerApp:
     def _build_layout(self) -> None:
         frame = tk.Frame(self.root, padx=20, pady=20)
         frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
 
         tk.Label(frame, text="Status:").grid(row=0, column=0, sticky="w")
         tk.Label(frame, textvariable=self.status_var, width=20).grid(row=0, column=1, sticky="w")
@@ -99,6 +109,22 @@ class RemoteChillerApp:
         tk.Label(frame, textvariable=self.message_var, fg="red").grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(12, 0)
         )
+
+        plot_frame = tk.LabelFrame(frame, text="Temperature Trend", padx=10, pady=10)
+        plot_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        frame.rowconfigure(6, weight=1)
+
+        self.figure = Figure(figsize=(6, 3), dpi=100)
+        self.axes = self.figure.add_subplot(111)
+        self.axes.set_xlabel("Time (min)")
+        self.axes.set_ylabel("Temperature (°C)")
+        self.axes.grid(True, linestyle="--", linewidth=0.5)
+        (self.temperature_line,) = self.axes.plot([], [], marker="o", linestyle="-", color="#1f77b4")
+        self.figure.tight_layout()
+
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
         for child in frame.winfo_children():
             child.grid_configure(padx=4, pady=4)
@@ -154,12 +180,46 @@ class RemoteChillerApp:
             return
 
         self.status_var.set(status)
-        self.temperature_var.set(f"{float(temperature):.2f} °C")
+        temperature_value = float(temperature)
+        self.temperature_var.set(f"{temperature_value:.2f} °C")
         self.setpoint_var.set(f"{float(setpoint):.2f} °C")
         self.running_var.set(running)
+        self._record_temperature(temperature_value)
         self._update_running_state()
         if clear_message:
             self.message_var.set("")
+
+    def _record_temperature(self, value: float) -> None:
+        timestamp = time.time()
+        self.temperature_history.append((timestamp, value))
+        if len(self.temperature_history) > self._max_history_points:
+            self.temperature_history = self.temperature_history[-self._max_history_points :]
+        self._update_temperature_plot()
+
+    def _update_temperature_plot(self) -> None:
+        if not self.temperature_history:
+            return
+
+        times, temps = zip(*self.temperature_history)
+        start_time = times[0]
+        elapsed_minutes = [(t - start_time) / 60 for t in times]
+        self.temperature_line.set_data(elapsed_minutes, temps)
+
+        if len(elapsed_minutes) == 1 or elapsed_minutes[-1] == 0:
+            x_max = 1.0
+        else:
+            x_max = elapsed_minutes[-1]
+        self.axes.set_xlim(0.0, max(x_max, 1.0))
+
+        temp_min = min(temps)
+        temp_max = max(temps)
+        if temp_min == temp_max:
+            padding = max(0.5, abs(temp_min) * 0.05)
+        else:
+            padding = (temp_max - temp_min) * 0.1
+        self.axes.set_ylim(temp_min - padding, temp_max + padding)
+
+        self.axes.figure.canvas.draw_idle()
 
 
 def parse_args() -> argparse.Namespace:
