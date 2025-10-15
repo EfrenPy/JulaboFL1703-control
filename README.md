@@ -1,42 +1,62 @@
-# Julabo-control
+# Julabo Control Suite
 
-Python module and command line utility for remote controlling a Julabo
-recirculating chiller via RS232.
+Comprehensive utilities for operating a Julabo recirculating chiller from Python.  The
+project bundles a reusable library, a command-line interface, a local desktop GUI, and a
+small TCP service with a remote GUI client.
+
+## Project layout
+
+```
+Julabo-control/
+├── julabo_control/        # Reusable Python package
+│   ├── core.py            # Serial helpers and JulaboChiller implementation
+│   ├── gui.py             # Local Tk interface built on top of the core module
+│   ├── ui.py              # Shared Tk/matplotlib utilities
+│   ├── cli.py             # Command line entrypoint (``python -m julabo_control``)
+│   └── __main__.py        # Thin wrapper that dispatches to ``cli.main``
+├── remote_client.py       # Tk GUI that talks to a remote Julabo server
+├── remote_control_server.py  # TCP JSON server exposing Julabo commands
+├── requirements.txt       # Runtime dependencies (PySerial + matplotlib)
+└── README.md              # This guide
+```
+
+The code is structured so that all shared logic (serial communication, GUI helpers, font
+configuration, temperature chart handling, and port caching) lives inside the
+`julabo_control` package.  The standalone scripts import those helpers, keeping the
+entrypoints concise and easy to maintain.
 
 ## Requirements
 
 * Python 3.8+
-* [`pyserial`](https://pyserial.readthedocs.io/en/latest/) (`pip install pyserial`)
-* Null-modem cable and RS232-to-USB converter connected to the chiller
+* [`pyserial`](https://pyserial.readthedocs.io/en/latest/)
+* [`matplotlib`](https://matplotlib.org/)
+* A Julabo chiller connected through a null-modem cable and an RS232-to-USB adapter
+
+Install the dependencies into a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Preparing the chiller
 
 1. Switch the Julabo chiller off.
 2. Wait at least five seconds.
-3. Press **arrow up** and **return** simultaneously and, while holding them,
-   press the power button.
-4. The display must show `IOn`. If it shows `IOFF`, repeat the previous
-   steps.
-5. After a few seconds the display switches to `rOFF`, indicating that
-   remote control is active.
+3. Press **arrow up** and **return** simultaneously and, while holding them, press the
+   power button.
+4. The display must show `IOn`. If it shows `IOFF`, repeat the previous steps.
+5. After a few seconds the display switches to `rOFF`, indicating that remote control is
+   active.
 
-## Setup
+## Local tools
 
-Create an isolated environment, install the dependencies, and verify that the
-modules compile before running any of the utilities:
+### Command line interface
 
-```bash
-python38 -m venv venv  # or use python3 if python3 -V reports >= 3.8
-source venv/bin/activate
-pip install -r requirements.txt
-python -m compileall .
-```
-
-## Running the CLI
-
-The tool can automatically probe USB serial adapters until it finds the
-Julabo controller. This works on Linux (``/dev/ttyUSB0`` style paths) and on
-Windows (``COM3`` style names). Simply run one of the following commands:
+The CLI automatically probes USB serial adapters until it finds the Julabo controller.
+This works on Linux (``/dev/ttyUSB0`` style paths) and on Windows (``COM3`` style names).
+Run any of the following commands:
 
 ```bash
 python -m julabo_control version
@@ -45,12 +65,15 @@ python -m julabo_control set-setpoint 18.5
 python -m julabo_control start
 ```
 
-You can still pass `--port /dev/ttyUSB0` (or `--port COM3` on Windows) to override the
-auto-detected device. The last working port is cached in
-`~/.julabo_control_port` so subsequent runs, including the GUI, connect
-instantly without additional prompts.
+Optional flags:
 
-The most common commands are implemented directly:
+* `--port /dev/ttyUSB0` – override the auto-detected device (use `COM3` on Windows)
+* `--timeout 5.0` – change the serial read timeout in seconds
+
+The CLI caches the last working port in `~/.julabo_control_port`, so subsequent runs (and
+GUI launches) reuse the stored device automatically.
+
+Supported subcommands:
 
 * `version` – return the identification string
 * `status` – return the status message (manual section 11.4)
@@ -59,13 +82,25 @@ The most common commands are implemented directly:
 * `get-temperature` – read the process temperature (`in_pv_00`)
 * `start` / `stop` – toggle remote cooling (`out_mode_05 1`/`0`)
 * `send` – send an arbitrary raw command (for advanced usage)
-* `gui` – launch a desktop interface for monitoring and changing the setpoint
+* `gui` – launch the desktop interface described below
 
-The serial configuration matches the recommendation from the manual and
-the tested `screen` configuration: 4800 baud, 7 data bits, even parity,
-1 stop bit, RTS/CTS flow control and a 2 second read timeout.
+### Local GUI
 
-## Python API
+`julabo_control.gui.run_gui` powers a lightweight Tk window that displays the current
+setpoint and process temperature, refreshing every five seconds.  Enter a new setpoint in
+the input field and press **Apply** to send the update to the chiller.  A matplotlib chart
+keeps track of the most recent readings.
+
+Launch the interface with:
+
+```bash
+python -m julabo_control gui
+```
+
+If no port is specified the program reuses the cached port or searches connected
+adapters until it finds the chiller.
+
+### Python API
 
 ```python
 from julabo_control import JulaboChiller, SerialSettings
@@ -77,54 +112,45 @@ with JulaboChiller(SerialSettings(port="/dev/ttyUSB0")) as chiller:
     chiller.start()
 ```
 
-If the chiller returns an error message (see manual section 11.5) the
-library raises `JulaboError`. Timeout and serial errors are also
-surfaced, making it easy to handle communication issues in higher level
-scripts.
+The API raises `JulaboError` when the chiller reports an error message.  Timeouts and
+PySerial exceptions are surfaced directly, allowing higher-level code to handle
+communication issues gracefully.
 
-## Graphical interface
+## Remote operation
 
-The GUI command provides a lightweight Tk window that continuously
-displays the current setpoint and process temperature, refreshing every
-five seconds. Enter a new setpoint in the input field and press **Apply**
-to send the update to the chiller.
+For situations where the computer connected to the Julabo does not have local user
+access, the suite provides a TCP JSON server and a companion GUI client.
 
-Launch the interface with `python -m julabo_control gui`. The program will
-reuse the last working port or search connected adapters until it reaches
-the chiller. Once connected it continuously refreshes the display every
-five seconds.
+### Server
 
-## Network remote control
+```bash
+python remote_control_server.py --host 0.0.0.0 --port 8765
+```
 
-For situations where the computer connected to the Julabo does not have
-direct user access, the project includes a small TCP server and a remote
-GUI client.
+* Automatically scans local serial ports, covering both `/dev/ttyUSB*` and `COM*`
+  device names.
+* Retries the search every few seconds until the chiller becomes available.
+* Accepts optional overrides such as `--baudrate`, `--timeout`, `--host`, and `--port`.
 
-1. Start the server on the machine that has the serial connection:
+### Client
 
-   ```bash
-   python remote_control_server.py --host 0.0.0.0 --port 8765
-   ```
+```bash
+python remote_client.py --host pctpx4ctl.cern.ch --port 8765
+```
 
-   The program automatically scans local serial ports, covering both
-   `/dev/ttyUSB0` style paths on Linux and `COM` style device names on
-   Windows. If no Julabo controller is found it keeps retrying every few
-   seconds until the adapter appears. Pass an explicit port (for example
-   `python remote_control_server.py COM3`) if you prefer to override the
-   auto-detected adapter. The server stays connected to the chiller and listens
-   for JSON commands over the configured TCP socket.
+The client defaults to `pctpx4ctl.cern.ch` when no host is provided.  Use `--host` to
+point it to another server.  The window mirrors the local GUI: it shows the current
+status, temperature, setpoint, and machine state, with controls for refreshing readings,
+updating the setpoint, and starting or stopping circulation.  The embedded temperature
+chart reuses the shared plotting helper from the core package for a consistent look.
 
-2. On another computer, run the GUI client and point it to the server:
+Each client request opens a short-lived TCP connection, making it easy to operate the
+chiller from multiple machines on the same network without managing persistent sessions.
 
-   ```bash
-   python remote_client.py --port 8765
-   ```
+## Development tips
 
-   The client defaults to `pctpx4ctl.cern.ch` when no host is provided.
-   Pass an explicit hostname or IP address if the server runs elsewhere.
-   The window provides buttons to refresh readings, start or stop the
-   circulation pump, and update the temperature setpoint.
-
-Each client request opens a short-lived TCP connection, making it easy to
-operate the chiller from multiple machines on the same network without
-manual port forwarding or persistent sessions.
+* Run `python -m julabo_control --help` to inspect CLI options.
+* `python remote_control_server.py --help` and `python remote_client.py --help` describe
+  optional flags for the network utilities.
+* The shared helpers live under `julabo_control/ui.py` and can be reused by additional
+  tools if you extend the suite.
