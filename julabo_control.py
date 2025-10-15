@@ -17,7 +17,6 @@ The CLI wraps a thin :class:`JulaboChiller` class that manages the serial
 connection and exposes typed helper methods for the most common
 operations.
 """
-from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
