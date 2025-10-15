@@ -1,4 +1,6 @@
-"""TCP server exposing Julabo chiller controls over the network."""
+"""TCP server that exposes a Julabo chiller over the network."""
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -19,7 +21,6 @@ from julabo_control import (
     SerialSettings,
     auto_detect_port,
 )
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,26 +67,7 @@ class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 target = message.get("value")
                 if target is None:
                     raise ValueError("'set_running' requires a boolean 'value'")
-                if isinstance(target, str):
-                    normalized = target.strip().lower()
-                    if normalized in {"1", "true", "on", "start", "run"}:
-                        target_bool = True
-                    elif normalized in {"0", "false", "off", "stop", "halt"}:
-                        target_bool = False
-                    else:
-                        raise ValueError(
-                            "Unable to interpret 'value' for set_running. "
-                            "Use a boolean, 0/1, or on/off string."
-                        )
-                elif isinstance(target, (int, float)):
-                    target_bool = bool(target)
-                elif isinstance(target, bool):
-                    target_bool = target
-                else:
-                    raise ValueError(
-                        "Unsupported type for 'value' in set_running; "
-                        "expected bool, number, or string."
-                    )
+                target_bool = _normalize_boolean(target)
                 result = self.chiller.set_running(target_bool)
             elif command == "ping":
                 result = "pong"
@@ -116,6 +98,22 @@ class JulaboRequestHandler(socketserver.StreamRequestHandler):
 
             data = json.dumps(response).encode("utf-8") + b"\n"
             self.wfile.write(data)
+
+
+def _normalize_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "on", "start", "run"}:
+            return True
+        if normalized in {"0", "false", "off", "stop", "halt"}:
+            return False
+    raise ValueError(
+        "Unable to interpret 'value' for set_running. Use a boolean, number, or supported string."
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
