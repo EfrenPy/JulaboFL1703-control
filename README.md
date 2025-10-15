@@ -20,6 +20,18 @@ recirculating chiller via RS232.
 5. After a few seconds the display switches to `rOFF`, indicating that
    remote control is active.
 
+## Setup
+
+Create an isolated environment, install the dependencies, and verify that the
+modules compile before running any of the utilities:
+
+```bash
+python38 -m venv venv  # or use python3 if python3 -V reports >= 3.8
+source venv/bin/activate
+pip install -r requirements.txt
+python -m compileall .
+```
+
 ## Running the CLI
 
 The tool can automatically probe USB serial adapters until it finds the
