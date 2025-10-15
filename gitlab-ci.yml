@@ -1,0 +1,6 @@
+stages:
+  - test
+  - docs
+
+include:
+  - local: 'workflows/confluence-sync.yml'

@@ -1,0 +1,102 @@
+confluence-sync:
+  stage: docs
+  image: python:3.11-slim
+  needs: ["smoke-test"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      changes:
+        - README.md
+  variables:
+    CONFLUENCE_HOST: "https://example.com"
+    CONFLUENCE_SPACE: "EXAMPLE"
+    CONFLUENCE_TITLE: "Julabo+Chiller+control"
+    DEBIAN_FRONTEND: "noninteractive"
+  before_script:
+    - set -e
+    - apt-get update && apt-get install -y curl ca-certificates jq
+    - python -m pip install --upgrade pip
+    - python -m pip install requests markdown
+  script: |-
+    set -euo pipefail
+
+    # 0) Token present?
+    : "${CONFLUENCE_API_EFREN:?Missing CONFLUENCE_API_EFREN}"
+
+    # 1) Preflight: space reachable with Bearer token
+    STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer ${CONFLUENCE_API_EFREN}" \
+      "${CONFLUENCE_HOST}/rest/api/space/${CONFLUENCE_SPACE}")"
+    echo "Confluence preflight -> HTTP ${STATUS}"
+    if [ "${STATUS}" != "200" ]; then
+      echo "❌ Auth failed (HTTP ${STATUS})."
+      exit 1
+    fi
+
+    # 2) Resolve PAGE_ID for title in space
+    PAGE_ID="$(curl -sS \
+      -H "Authorization: Bearer ${CONFLUENCE_API_EFREN}" \
+      "${CONFLUENCE_HOST}/rest/api/content?spaceKey=${CONFLUENCE_SPACE}&title=${CONFLUENCE_TITLE}" \
+      | jq -r '.results[0].id // empty')"
+    if [ -z "${PAGE_ID}" ]; then
+      echo "❌ Page '${CONFLUENCE_TITLE}' not found in space '${CONFLUENCE_SPACE}'."
+      exit 1
+    fi
+    export PAGE_ID
+    echo "Target page id: ${PAGE_ID}"
+
+    # 3) Convert README.md (Markdown) -> HTML and publish as Confluence storage
+    python - <<'PY'
+    import os, sys, json, requests
+    from markdown import markdown
+
+    host  = os.environ["CONFLUENCE_HOST"].rstrip("/")
+    pid   = os.environ["PAGE_ID"]
+    token = os.environ["CONFLUENCE_API_EFREN"]
+
+    # Read README and convert to HTML
+    with open("README.md", "r", encoding="utf-8") as f:
+        md = f.read()
+    html = markdown(md, extensions=["extra", "toc", "codehilite", "sane_lists"])
+
+    # Wrap with the requested preface/postface
+    storage = html
+
+    # Get current page version and title
+    r = requests.get(
+        f"{host}/rest/api/content/{pid}?expand=version",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    info = r.json()
+    ver   = info["version"]["number"]
+    title = info["title"]
+
+    payload = {
+      "id": pid,
+      "type": "page",
+      "title": title,
+      "version": {"number": ver + 1},
+      "body": {
+        "storage": {
+          "value": storage,
+          "representation": "storage"
+        }
+      }
+    }
+
+    r2 = requests.put(
+        f"{host}/rest/api/content/{pid}",
+        headers={
+          "Authorization": f"Bearer {token}",
+          "Content-Type": "application/json"
+        },
+        data=json.dumps(payload),
+        timeout=60,
+    )
+    if not r2.ok:
+        print("PUT failed:", r2.status_code, r2.text[:500], file=sys.stderr)
+        r2.raise_for_status()
+
+    print(f"✅ Confluence page updated: {title} (new version: {ver+1})")
+    PY
