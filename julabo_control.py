@@ -20,7 +20,7 @@ operations.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import serial
 from serial.tools import list_ports
@@ -133,7 +133,11 @@ class JulaboChiller:
     def set_setpoint(self, value: float) -> None:
         """Update the temperature setpoint."""
 
-        self._query(f"out_sp_00 {value:.1f}")
+        # ``out_`` commands issued to the Julabo do not generate a reply.  The
+        # controller silently applies the requested change, meaning waiting for a
+        # response would time out.  Send the command and then explicitly read the
+        # setpoint back to confirm it was applied.
+        self._write(f"out_sp_00 {value:.1f}")
 
         # Read the setpoint back from the controller to confirm it has been
         # applied.  The device echoes the setpoint with one decimal place, so
@@ -156,7 +160,9 @@ class JulaboChiller:
         """Start or stop the circulation pump and confirm the new state."""
 
         value = 1 if start else 0
-        self._query(f"out_mode_05 {value}")
+        # ``out_`` commands do not send a response, so only issue the write and
+        # rely on a follow-up ``in_`` command to confirm the change.
+        self._write(f"out_mode_05 {value}")
 
         confirmed = self.is_running()
         if confirmed != start:
@@ -296,9 +302,13 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     error dialog to inform the user.
     """
 
+    import time
     import tkinter as tk
     from tkinter import messagebox
     from tkinter import font as tkfont
+
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
 
     chiller: Optional[JulaboChiller] = None
     refresh_job: Optional[str] = None
@@ -339,7 +349,122 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     setpoint_var = tk.StringVar(value="--")
     temp_var = tk.StringVar(value="--")
     status_var = tk.StringVar()
+    status_label: Optional[tk.Label] = None
     running_var = tk.BooleanVar(value=False)
+
+    temperature_history: List[Tuple[float, float]] = []
+    history_retention_seconds = 12 * 60 * 60
+    time_window_minutes = 5.0
+    axes = None
+    canvas = None
+    temperature_line = None
+    slider_var = tk.DoubleVar(value=0.0)
+    timeline_slider: Optional[tk.Scale] = None
+
+    def show_status(message: str, *, color: str = "red") -> None:
+        status_var.set(message)
+        if status_label is not None:
+            status_label.configure(fg=color)
+
+    def clear_temperature_plot() -> None:
+        temperature_history.clear()
+        slider_var.set(0.0)
+        if timeline_slider is not None:
+            timeline_slider.configure(to=0.0)
+        if axes is None or canvas is None or temperature_line is None:
+            return
+        temperature_line.set_data([], [])
+        axes.set_xlim(0.0, 1.0)
+        axes.set_ylim(0.0, 1.0)
+        canvas.draw_idle()
+
+    def trim_temperature_history() -> None:
+        if not temperature_history:
+            return
+
+        cutoff = temperature_history[-1][0] - history_retention_seconds
+        if temperature_history[0][0] >= cutoff:
+            return
+
+        first_index = 0
+        for idx, (timestamp, _value) in enumerate(temperature_history):
+            if timestamp >= cutoff:
+                first_index = idx
+                break
+        if first_index:
+            del temperature_history[:first_index]
+
+    def update_slider_range() -> None:
+        if timeline_slider is None:
+            return
+
+        if len(temperature_history) < 2:
+            timeline_slider.configure(to=0.0)
+            if slider_var.get() != 0.0:
+                slider_var.set(0.0)
+            return
+
+        start_time = temperature_history[0][0]
+        end_time = temperature_history[-1][0]
+        total_minutes = (end_time - start_time) / 60
+        max_offset = max(0.0, total_minutes - time_window_minutes)
+
+        current_to = float(timeline_slider.cget("to"))
+        if abs(current_to - max_offset) > 1e-6:
+            timeline_slider.configure(to=max_offset)
+        if slider_var.get() > max_offset:
+            slider_var.set(max_offset)
+
+    def on_slider_change(_value: str) -> None:
+        update_temperature_plot()
+
+    def update_temperature_plot() -> None:
+        if not temperature_history or axes is None or canvas is None or temperature_line is None:
+            return
+
+        update_slider_range()
+
+        times, temps = zip(*temperature_history)
+        offset_minutes = max(slider_var.get(), 0.0)
+        end_time = times[-1] - offset_minutes * 60
+        start_time = end_time - time_window_minutes * 60
+        if start_time < times[0]:
+            start_time = times[0]
+            end_time = min(start_time + time_window_minutes * 60, times[-1])
+
+        window_times: List[float] = []
+        window_temps: List[float] = []
+        for timestamp, temp in temperature_history:
+            if start_time <= timestamp <= end_time:
+                window_times.append(timestamp)
+                window_temps.append(temp)
+
+        if not window_times:
+            window_times = [times[-1]]
+            window_temps = [temps[-1]]
+            start_time = window_times[0]
+
+        elapsed_minutes = [(timestamp - start_time) / 60 for timestamp in window_times]
+        temperature_line.set_data(elapsed_minutes, window_temps)
+
+        x_span = elapsed_minutes[-1] if elapsed_minutes else 0.0
+        axes.set_xlim(0.0, max(x_span, 1.0))
+
+        temp_min = min(window_temps)
+        temp_max = max(window_temps)
+        if temp_min == temp_max:
+            padding = max(0.5, abs(temp_min) * 0.05)
+        else:
+            padding = (temp_max - temp_min) * 0.1
+        axes.set_ylim(temp_min - padding, temp_max + padding)
+
+        canvas.draw_idle()
+
+    def record_temperature(value: float) -> None:
+        temperature_history.append((time.time(), value))
+        trim_temperature_history()
+        update_slider_range()
+        update_temperature_plot()
 
     def cancel_refresh() -> None:
         nonlocal refresh_job
@@ -354,8 +479,9 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         nonlocal refresh_job
         refresh_job = None
         if chiller is None:
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
             running_var.set(False)
+            clear_temperature_plot()
             return
 
         try:
@@ -363,26 +489,27 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             temperature = chiller.get_temperature()
             running = chiller.is_running()
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
-            status_var.set(f"Error: {exc}")
+            show_status(f"Error: {exc}")
         else:
             setpoint_var.set(f"{setpoint:.2f} °C")
             temp_var.set(f"{temperature:.2f} °C")
             running_var.set(running)
             update_running_button()
-            status_var.set("")
+            show_status("", color="black")
+            record_temperature(temperature)
         finally:
             if chiller is not None and root.winfo_exists():
                 refresh_job = root.after(5000, refresh_readings)
 
     def update_running_button() -> None:
         if chiller is None:
-            toggle_button.configure(state="disabled", text="Start cooling")
+            toggle_button.configure(state="disabled", text="Start machine")
             running_var.set(False)
             return
 
         toggle_button.configure(state="normal")
         toggle_button.configure(
-            text="Stop cooling" if running_var.get() else "Start cooling"
+            text="Stop machine" if running_var.get() else "Start machine"
         )
 
     def set_connected(
@@ -398,6 +525,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
         cancel_refresh()
         chiller = new_chiller
+        clear_temperature_plot()
 
         if new_settings is not None:
             timeout_value = new_settings.timeout
@@ -415,12 +543,12 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             apply_button.configure(state="disabled")
             port_entry.focus_set()
             update_running_button()
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
 
     def test_connection() -> None:
         port = port_var.get().strip()
         if not port:
-            status_var.set("Enter a serial port path.")
+            show_status("Enter a serial port path.")
             set_connected(None, None)
             return
 
@@ -434,23 +562,23 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             messagebox.showerror("Connection error", str(exc), parent=root)
             set_connected(None, None)
         else:
-            status_var.set(f"Connected to {port}.")
+            show_status(f"Connected to {port}.", color="green")
             set_connected(tester, new_settings)
 
     def apply_setpoint() -> None:
         raw_value = entry_var.get().strip()
         if not raw_value:
-            status_var.set("Enter a temperature first.")
+            show_status("Enter a temperature first.")
             return
 
         if chiller is None:
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
             return
 
         try:
             value = float(raw_value)
         except ValueError:
-            status_var.set("Invalid temperature value.")
+            show_status("Invalid temperature value.")
             return
 
         try:
@@ -458,24 +586,27 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
             messagebox.showerror("Setpoint error", str(exc), parent=root)
         else:
-            status_var.set(f"Setpoint updated to {value:.2f} °C")
+            show_status(f"Setpoint updated to {value:.2f} °C", color="green")
             entry_var.set("")
             refresh_readings()
 
     def toggle_running() -> None:
         if chiller is None:
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
             return
 
         target_state = not running_var.get()
         try:
             confirmed = chiller.set_running(target_state)
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
-            messagebox.showerror("Cooling control error", str(exc), parent=root)
+            messagebox.showerror("Machine control error", str(exc), parent=root)
         else:
             running_var.set(confirmed)
             update_running_button()
-            status_var.set("Cooling started" if confirmed else "Cooling stopped")
+            show_status(
+                "Machine started" if confirmed else "Machine stopped",
+                color="green",
+            )
 
     def on_close() -> None:
         if chiller is not None:
@@ -486,6 +617,11 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     main_frame = tk.Frame(root, padx=20, pady=20)
     main_frame.pack(fill=tk.BOTH, expand=True)
+
+    main_frame.grid_columnconfigure(0, weight=1)
+    main_frame.grid_columnconfigure(1, weight=1)
+    main_frame.grid_columnconfigure(2, weight=1)
+    main_frame.grid_rowconfigure(6, weight=1)
 
     tk.Label(main_frame, text="Serial port:").grid(row=0, column=0, sticky=tk.W)
     port_entry = tk.Entry(main_frame, textvariable=port_var, width=20)
@@ -507,11 +643,42 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     apply_button = tk.Button(main_frame, text="Apply", command=apply_setpoint)
     apply_button.grid(row=3, column=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
 
-    toggle_button = tk.Button(main_frame, text="Start cooling", command=toggle_running)
+    toggle_button = tk.Button(main_frame, text="Start machine", command=toggle_running)
     toggle_button.grid(row=4, column=0, columnspan=3, sticky=tk.W)
 
-    status_label = tk.Label(main_frame, textvariable=status_var, fg="red")
+    status_label = tk.Label(main_frame, textvariable=status_var, fg="black")
     status_label.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+
+    plot_frame = tk.LabelFrame(main_frame, text="Temperature trend", padx=10, pady=10)
+    plot_frame.grid(row=6, column=0, columnspan=3, sticky=tk.NSEW, pady=(10, 0))
+
+    figure = Figure(figsize=(6, 3), dpi=100)
+    axes = figure.add_subplot(111)
+    axes.set_xlabel("Time (min)")
+    axes.set_ylabel("Temperature (°C)")
+    axes.grid(True, linestyle="--", linewidth=0.5)
+    (temperature_line,) = axes.plot([], [], marker="o", linestyle="-", color="#1f77b4")
+    figure.tight_layout()
+
+    canvas = FigureCanvasTkAgg(figure, master=plot_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    slider_container = tk.Frame(plot_frame)
+    slider_container.pack(fill=tk.X, expand=False, pady=(10, 0))
+    tk.Label(slider_container, text="History offset (minutes):").pack(side=tk.LEFT)
+    timeline_slider = tk.Scale(
+        slider_container,
+        variable=slider_var,
+        from_=0.0,
+        to=0.0,
+        resolution=0.1,
+        orient=tk.HORIZONTAL,
+        command=on_slider_change,
+    )
+    timeline_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+
+    clear_temperature_plot()
 
     for child in main_frame.winfo_children():
         child.grid_configure(padx=4, pady=4)
@@ -541,10 +708,10 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     if chiller is not None:
         set_connected(chiller, settings)
-        status_var.set("")
+        show_status("", color="black")
     else:
         set_connected(None, None)
-        status_var.set("Connect the Julabo chiller and press Test connection.")
+        show_status("Connect the Julabo chiller and press Test connection.")
 
     try:
         root.mainloop()
