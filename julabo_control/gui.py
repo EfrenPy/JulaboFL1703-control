@@ -16,14 +16,14 @@ def run_gui(
 ) -> None:
     """Launch a small Tk GUI for interactive temperature control."""
 
-    configure_default_fonts()
-
     chiller: Optional[JulaboChiller] = None
     refresh_job: Optional[str] = None
     timeout_value = settings.timeout if settings is not None else DEFAULT_TIMEOUT
 
     root = tk.Tk()
     root.title("Julabo Chiller Control")
+
+    configure_default_fonts()
 
     connection_error = startup_error
 
