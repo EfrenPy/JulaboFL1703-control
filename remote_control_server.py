@@ -53,15 +53,40 @@ class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 if value is None:
                     raise ValueError("'set_setpoint' requires a numeric 'value'")
                 self.chiller.set_setpoint(float(value))
-                result = "ok"
+                result = self.chiller.get_setpoint()
             elif command == "temperature":
                 result = self.chiller.get_temperature()
+            elif command == "is_running":
+                result = self.chiller.is_running()
             elif command == "start":
-                self.chiller.start()
-                result = "ok"
+                result = self.chiller.start()
             elif command == "stop":
-                self.chiller.stop()
-                result = "ok"
+                result = self.chiller.stop()
+            elif command == "set_running":
+                target = message.get("value")
+                if target is None:
+                    raise ValueError("'set_running' requires a boolean 'value'")
+                if isinstance(target, str):
+                    normalized = target.strip().lower()
+                    if normalized in {"1", "true", "on", "start", "run"}:
+                        target_bool = True
+                    elif normalized in {"0", "false", "off", "stop", "halt"}:
+                        target_bool = False
+                    else:
+                        raise ValueError(
+                            "Unable to interpret 'value' for set_running. "
+                            "Use a boolean, 0/1, or on/off string."
+                        )
+                elif isinstance(target, (int, float)):
+                    target_bool = bool(target)
+                elif isinstance(target, bool):
+                    target_bool = target
+                else:
+                    raise ValueError(
+                        "Unsupported type for 'value' in set_running; "
+                        "expected bool, number, or string."
+                    )
+                result = self.chiller.set_running(target_bool)
             elif command == "ping":
                 result = "pong"
             else:
