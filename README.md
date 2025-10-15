@@ -80,3 +80,34 @@ Launch the interface with `python -m julabo_control gui`. The program will
 reuse the last working port or search connected adapters until it reaches
 the chiller. Once connected it continuously refreshes the display every
 five seconds.
+
+## Network remote control
+
+For situations where the computer connected to the Julabo does not have
+direct user access, the project includes a small TCP server and a remote
+GUI client.
+
+1. Start the server on the machine that has the serial connection:
+
+   ```bash
+   python remote_control_server.py /dev/ttyUSB0 --host 0.0.0.0 --port 8765
+   ```
+
+   Replace `/dev/ttyUSB0` with the correct serial device path. The server
+   stays connected to the chiller and listens for JSON commands over the
+   configured TCP socket.
+
+2. On another computer, run the GUI client and point it to the server:
+
+   ```bash
+   python remote_client.py --port 8765
+   ```
+
+   The client defaults to `localhost` when no host is provided.
+   Pass an explicit hostname or IP address if the server runs elsewhere.
+   The window provides buttons to refresh readings, start or stop the
+   circulation pump, and update the temperature setpoint.
+
+Each client request opens a short-lived TCP connection, making it easy to
+operate the chiller from multiple machines on the same network without
+manual port forwarding or persistent sessions.
