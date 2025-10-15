@@ -353,24 +353,13 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     running_var = tk.BooleanVar(value=False)
 
     temperature_history: List[Tuple[float, float]] = []
-    history_retention_seconds = 12 * 60 * 60
-    time_window_minutes = 5.0
+    max_history_points = 120
     axes = None
     canvas = None
     temperature_line = None
-    slider_var = tk.DoubleVar(value=0.0)
-    timeline_slider: Optional[tk.Scale] = None
-
-    def show_status(message: str, *, color: str = "red") -> None:
-        status_var.set(message)
-        if status_label is not None:
-            status_label.configure(fg=color)
 
     def clear_temperature_plot() -> None:
         temperature_history.clear()
-        slider_var.set(0.0)
-        if timeline_slider is not None:
-            timeline_slider.configure(to=0.0)
         if axes is None or canvas is None or temperature_line is None:
             return
         temperature_line.set_data([], [])
@@ -378,80 +367,23 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         axes.set_ylim(0.0, 1.0)
         canvas.draw_idle()
 
-    def trim_temperature_history() -> None:
-        if not temperature_history:
-            return
-
-        cutoff = temperature_history[-1][0] - history_retention_seconds
-        if temperature_history[0][0] >= cutoff:
-            return
-
-        first_index = 0
-        for idx, (timestamp, _value) in enumerate(temperature_history):
-            if timestamp >= cutoff:
-                first_index = idx
-                break
-        if first_index:
-            del temperature_history[:first_index]
-
-    def update_slider_range() -> None:
-        if timeline_slider is None:
-            return
-
-        if len(temperature_history) < 2:
-            timeline_slider.configure(to=0.0)
-            if slider_var.get() != 0.0:
-                slider_var.set(0.0)
-            return
-
-        start_time = temperature_history[0][0]
-        end_time = temperature_history[-1][0]
-        total_minutes = (end_time - start_time) / 60
-        max_offset = max(0.0, total_minutes - time_window_minutes)
-
-        current_to = float(timeline_slider.cget("to"))
-        if abs(current_to - max_offset) > 1e-6:
-            timeline_slider.configure(to=max_offset)
-        if slider_var.get() > max_offset:
-            slider_var.set(max_offset)
-
-    def on_slider_change(_value: str) -> None:
-        update_temperature_plot()
-
     def update_temperature_plot() -> None:
         if not temperature_history or axes is None or canvas is None or temperature_line is None:
             return
 
-        update_slider_range()
-
         times, temps = zip(*temperature_history)
-        offset_minutes = max(slider_var.get(), 0.0)
-        end_time = times[-1] - offset_minutes * 60
-        start_time = end_time - time_window_minutes * 60
-        if start_time < times[0]:
-            start_time = times[0]
-            end_time = min(start_time + time_window_minutes * 60, times[-1])
+        start_time = times[0]
+        elapsed_minutes = [(timestamp - start_time) / 60 for timestamp in times]
+        temperature_line.set_data(elapsed_minutes, temps)
 
-        window_times: List[float] = []
-        window_temps: List[float] = []
-        for timestamp, temp in temperature_history:
-            if start_time <= timestamp <= end_time:
-                window_times.append(timestamp)
-                window_temps.append(temp)
+        if len(elapsed_minutes) == 1 or elapsed_minutes[-1] == 0:
+            x_max = 1.0
+        else:
+            x_max = elapsed_minutes[-1]
+        axes.set_xlim(0.0, max(x_max, 1.0))
 
-        if not window_times:
-            window_times = [times[-1]]
-            window_temps = [temps[-1]]
-            start_time = window_times[0]
-
-        elapsed_minutes = [(timestamp - start_time) / 60 for timestamp in window_times]
-        temperature_line.set_data(elapsed_minutes, window_temps)
-
-        x_span = elapsed_minutes[-1] if elapsed_minutes else 0.0
-        axes.set_xlim(0.0, max(x_span, 1.0))
-
-        temp_min = min(window_temps)
-        temp_max = max(window_temps)
+        temp_min = min(temps)
+        temp_max = max(temps)
         if temp_min == temp_max:
             padding = max(0.5, abs(temp_min) * 0.05)
         else:
@@ -462,8 +394,8 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     def record_temperature(value: float) -> None:
         temperature_history.append((time.time(), value))
-        trim_temperature_history()
-        update_slider_range()
+        if len(temperature_history) > max_history_points:
+            del temperature_history[:-max_history_points]
         update_temperature_plot()
 
     def cancel_refresh() -> None:
@@ -495,7 +427,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             temp_var.set(f"{temperature:.2f} °C")
             running_var.set(running)
             update_running_button()
-            show_status("", color="black")
+            status_var.set("")
             record_temperature(temperature)
         finally:
             if chiller is not None and root.winfo_exists():
@@ -663,20 +595,6 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     canvas = FigureCanvasTkAgg(figure, master=plot_frame)
     canvas.draw()
     canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    slider_container = tk.Frame(plot_frame)
-    slider_container.pack(fill=tk.X, expand=False, pady=(10, 0))
-    tk.Label(slider_container, text="History offset (minutes):").pack(side=tk.LEFT)
-    timeline_slider = tk.Scale(
-        slider_container,
-        variable=slider_var,
-        from_=0.0,
-        to=0.0,
-        resolution=0.1,
-        orient=tk.HORIZONTAL,
-        command=on_slider_change,
-    )
-    timeline_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
 
     clear_temperature_plot()
 
