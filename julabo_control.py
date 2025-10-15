@@ -258,6 +258,8 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     from tkinter import messagebox
 
     chiller: Optional[JulaboChiller] = None
+    refresh_job: Optional[str] = None
+    timeout_value = settings.timeout if settings is not None else DEFAULT_TIMEOUT
 
     root = tk.Tk()
     root.title("Julabo Chiller Control")
@@ -274,15 +276,24 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         else:
             _remember_port(settings.port)
 
-    if connection_error is not None:  # pragma: no cover - GUI runtime feedback
-        messagebox.showerror("Connection error", str(connection_error))
-
+    port_var = tk.StringVar(value=settings.port if settings is not None else "")
     entry_var = tk.StringVar()
     setpoint_var = tk.StringVar(value="--")
     temp_var = tk.StringVar(value="--")
     status_var = tk.StringVar()
 
+    def cancel_refresh() -> None:
+        nonlocal refresh_job
+        if refresh_job is not None:
+            try:
+                root.after_cancel(refresh_job)
+            except Exception:
+                pass
+            refresh_job = None
+
     def refresh_readings() -> None:
+        nonlocal refresh_job
+        refresh_job = None
         if chiller is None:
             status_var.set("Not connected to Julabo chiller.")
             return
@@ -297,8 +308,58 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             temp_var.set(f"{temperature:.2f} °C")
             status_var.set("")
         finally:
-            if root.winfo_exists():
-                root.after(5000, refresh_readings)
+            if chiller is not None and root.winfo_exists():
+                refresh_job = root.after(5000, refresh_readings)
+
+    def set_connected(
+        new_chiller: Optional[JulaboChiller], new_settings: Optional[SerialSettings]
+    ) -> None:
+        nonlocal chiller, timeout_value
+
+        if chiller is not None and chiller is not new_chiller:
+            try:
+                chiller.close()
+            except Exception:
+                pass
+
+        cancel_refresh()
+        chiller = new_chiller
+
+        if new_settings is not None:
+            timeout_value = new_settings.timeout
+            port_var.set(new_settings.port)
+            _remember_port(new_settings.port)
+
+        if chiller is not None:
+            entry.configure(state="normal")
+            apply_button.configure(state="normal")
+            entry.focus_set()
+            refresh_readings()
+        else:
+            entry.configure(state="disabled")
+            apply_button.configure(state="disabled")
+            port_entry.focus_set()
+            status_var.set("Not connected to Julabo chiller.")
+
+    def test_connection() -> None:
+        port = port_var.get().strip()
+        if not port:
+            status_var.set("Enter a serial port path.")
+            set_connected(None, None)
+            return
+
+        new_settings = SerialSettings(port=port, timeout=timeout_value)
+        tester = JulaboChiller(new_settings)
+        try:
+            tester.connect()
+            tester.identify()
+        except Exception as exc:  # pragma: no cover - GUI runtime feedback
+            tester.close()
+            messagebox.showerror("Connection error", str(exc), parent=root)
+            set_connected(None, None)
+        else:
+            status_var.set(f"Connected to {port}.")
+            set_connected(tester, new_settings)
 
     def apply_setpoint() -> None:
         raw_value = entry_var.get().strip()
@@ -319,7 +380,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         try:
             chiller.set_setpoint(value)
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
-            messagebox.showerror("Setpoint error", str(exc))
+            messagebox.showerror("Setpoint error", str(exc), parent=root)
         else:
             status_var.set(f"Setpoint updated to {value:.2f} °C")
             entry_var.set("")
@@ -334,36 +395,66 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     main_frame = tk.Frame(root, padx=12, pady=12)
     main_frame.pack(fill=tk.BOTH, expand=True)
 
-    tk.Label(main_frame, text="Current setpoint:").grid(row=0, column=0, sticky=tk.W)
-    tk.Label(main_frame, textvariable=setpoint_var).grid(row=0, column=1, sticky=tk.W)
+    tk.Label(main_frame, text="Serial port:").grid(row=0, column=0, sticky=tk.W)
+    port_entry = tk.Entry(main_frame, textvariable=port_var, width=20)
+    port_entry.grid(row=0, column=1, sticky=tk.W)
+    tk.Button(main_frame, text="Test connection", command=test_connection).grid(
+        row=0, column=2, sticky=tk.W
+    )
 
-    tk.Label(main_frame, text="Current temperature:").grid(row=1, column=0, sticky=tk.W)
-    tk.Label(main_frame, textvariable=temp_var).grid(row=1, column=1, sticky=tk.W)
+    tk.Label(main_frame, text="Current setpoint:").grid(row=1, column=0, sticky=tk.W)
+    tk.Label(main_frame, textvariable=setpoint_var).grid(row=1, column=1, sticky=tk.W)
 
-    tk.Label(main_frame, text="New setpoint (°C):").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+    tk.Label(main_frame, text="Current temperature:").grid(row=2, column=0, sticky=tk.W)
+    tk.Label(main_frame, textvariable=temp_var).grid(row=2, column=1, sticky=tk.W)
+
+    tk.Label(main_frame, text="New setpoint (°C):").grid(row=3, column=0, sticky=tk.W, pady=(8, 0))
     entry = tk.Entry(main_frame, textvariable=entry_var, width=10)
-    entry.grid(row=2, column=1, sticky=tk.W, pady=(8, 0))
-    entry.focus_set()
+    entry.grid(row=3, column=1, sticky=tk.W, pady=(8, 0))
 
-    button = tk.Button(main_frame, text="Apply", command=apply_setpoint)
-    button.grid(row=2, column=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+    apply_button = tk.Button(main_frame, text="Apply", command=apply_setpoint)
+    apply_button.grid(row=3, column=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
 
     status_label = tk.Label(main_frame, textvariable=status_var, fg="red")
-    status_label.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+    status_label.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
 
     for child in main_frame.winfo_children():
         child.grid_configure(padx=4, pady=4)
 
+    def center_window(window: tk.Tk) -> None:
+        """Place ``window`` roughly in the middle of the active screen."""
+
+        window.update_idletasks()
+        try:
+            window.eval(f"tk::PlaceWindow {window.winfo_toplevel()} center")
+        except tk.TclError:
+            width = window.winfo_width()
+            height = window.winfo_height()
+            x_offset = max((window.winfo_screenwidth() - width) // 2, 0)
+            y_offset = max((window.winfo_screenheight() - height) // 2, 0)
+            window.geometry(f"+{x_offset}+{y_offset}")
+
+    center_window(root)
+
+    if connection_error is not None:  # pragma: no cover - GUI runtime feedback
+        root.after(
+            0,
+            lambda err=connection_error: messagebox.showerror(
+                "Connection error", str(err), parent=root
+            ),
+        )
+
     if chiller is not None:
-        refresh_readings()
+        set_connected(chiller, settings)
+        status_var.set("")
     else:
-        entry.configure(state="disabled")
-        button.configure(state="disabled")
-        status_var.set("Connect the Julabo chiller and restart the GUI.")
+        set_connected(None, None)
+        status_var.set("Connect the Julabo chiller and press Test connection.")
 
     try:
         root.mainloop()
     finally:
+        cancel_refresh()
         if chiller is not None:
             chiller.close()
 
