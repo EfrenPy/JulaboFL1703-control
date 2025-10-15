@@ -358,6 +358,13 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     canvas = None
     temperature_line = None
 
+    def show_status(message: str, *, color: str = "red") -> None:
+        """Update the status label text and color."""
+
+        status_var.set(message)
+        if status_label is not None:
+            status_label.configure(fg=color)
+
     def clear_temperature_plot() -> None:
         temperature_history.clear()
         if axes is None or canvas is None or temperature_line is None:
@@ -427,7 +434,6 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             temp_var.set(f"{temperature:.2f} °C")
             running_var.set(running)
             update_running_button()
-            status_var.set("")
             record_temperature(temperature)
         finally:
             if chiller is not None and root.winfo_exists():
@@ -537,7 +543,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             update_running_button()
             show_status(
                 "Machine started" if confirmed else "Machine stopped",
-                color="green",
+                color="green" if confirmed else "red",
             )
 
     def on_close() -> None:
