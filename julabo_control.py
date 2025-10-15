@@ -246,28 +246,25 @@ def auto_detect_port(timeout: float) -> str:
     )
 
 
-def run_gui(settings: Optional[SerialSettings], initial_error: Optional[str] = None) -> None:
+def run_gui(settings: SerialSettings) -> None:
     """Launch a small Tk GUI for interactive temperature control."""
 
     import tkinter as tk
     from tkinter import messagebox
 
+    chiller = JulaboChiller(settings)
+
     root = tk.Tk()
     root.title("Julabo Chiller Control")
 
-    chiller: Optional[JulaboChiller] = None
-    connection_error = initial_error
-
-    if settings is not None:
-        chiller = JulaboChiller(settings)
-        try:
-            chiller.connect()
-        except Exception as exc:  # pragma: no cover - GUI runtime feedback
-            connection_error = str(exc)
-            messagebox.showerror("Connection error", connection_error)
-            chiller = None
-        else:
-            _remember_port(settings.port)
+    try:
+        chiller.connect()
+    except Exception as exc:  # pragma: no cover - GUI runtime feedback
+        messagebox.showerror("Connection error", str(exc))
+        root.destroy()
+        return
+    else:
+        _remember_port(settings.port)
 
     entry_var = tk.StringVar()
     setpoint_var = tk.StringVar(value="--")
@@ -275,26 +272,18 @@ def run_gui(settings: Optional[SerialSettings], initial_error: Optional[str] = N
     status_var = tk.StringVar()
 
     def refresh_readings() -> None:
-        nonlocal connection_error
-
-        if chiller is None:
-            if connection_error:
-                status_var.set(f"Connection error: {connection_error}")
-            else:
-                status_var.set("Not connected to chiller.")
+        try:
+            setpoint = chiller.get_setpoint()
+            temperature = chiller.get_temperature()
+        except Exception as exc:  # pragma: no cover - GUI runtime feedback
+            status_var.set(f"Error: {exc}")
         else:
-            try:
-                setpoint = chiller.get_setpoint()
-                temperature = chiller.get_temperature()
-            except Exception as exc:  # pragma: no cover - GUI runtime feedback
-                connection_error = str(exc)
-                status_var.set(f"Error: {exc}")
-            else:
-                setpoint_var.set(f"{setpoint:.2f} °C")
-                temp_var.set(f"{temperature:.2f} °C")
-                status_var.set("")
-        if root.winfo_exists():
-            root.after(5000, refresh_readings)
+            setpoint_var.set(f"{setpoint:.2f} °C")
+            temp_var.set(f"{temperature:.2f} °C")
+            status_var.set("")
+        finally:
+            if root.winfo_exists():
+                root.after(5000, refresh_readings)
 
     def apply_setpoint() -> None:
         raw_value = entry_var.get().strip()
@@ -307,10 +296,6 @@ def run_gui(settings: Optional[SerialSettings], initial_error: Optional[str] = N
             status_var.set("Invalid temperature value.")
             return
 
-        if chiller is None:
-            messagebox.showerror("Setpoint error", "Not connected to the Julabo chiller.")
-            return
-
         try:
             chiller.set_setpoint(value)
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
@@ -320,8 +305,7 @@ def run_gui(settings: Optional[SerialSettings], initial_error: Optional[str] = N
             entry_var.set("")
 
     def on_close() -> None:
-        if chiller is not None:
-            chiller.close()
+        chiller.close()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -353,8 +337,7 @@ def run_gui(settings: Optional[SerialSettings], initial_error: Optional[str] = N
     try:
         root.mainloop()
     finally:
-        if chiller is not None:
-            chiller.close()
+        chiller.close()
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -391,32 +374,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     subparsers.add_parser("stop", help="Stop cooling/circulation")
 
     raw_parser = subparsers.add_parser("send", help="Send a raw command string")
-    raw_parser.add_argument(
-        "raw_command",
-        help="Command to send, e.g. 'in_sp_00'",
-    )
+    raw_parser.add_argument("command", help="Command to send, e.g. 'in_sp_00'")
 
     args = parser.parse_args(argv)
 
-    port: Optional[str] = args.port
-    detection_error: Optional[str] = None
-
-    if args.command == "gui":
-        if port is None:
-            try:
-                port = auto_detect_port(args.timeout)
-            except serial.SerialException as exc:
-                detection_error = str(exc)
-                port = _read_cached_port()
-        settings = SerialSettings(port=port, timeout=args.timeout) if port else None
-    else:
-        if port is None:
-            port = auto_detect_port(args.timeout)
-        settings = SerialSettings(port=port, timeout=args.timeout)
+    port = args.port or auto_detect_port(args.timeout)
+    settings = SerialSettings(port=port, timeout=args.timeout)
 
     def run() -> Iterable[str]:
-        if settings is None:
-            raise RuntimeError("Serial settings are required for this command.")
         with JulaboChiller(settings) as chiller:
             _remember_port(settings.port)
             if args.command == "version":
@@ -437,7 +402,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 chiller.stop()
                 yield "Chiller stopped"
             elif args.command == "send":
-                yield chiller.raw_command(args.raw_command)
+                yield chiller.raw_command(args.command)
             elif args.command == "gui":
                 raise AssertionError("GUI command handled separately")
             else:  # pragma: no cover - defensive programming
@@ -445,7 +410,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     try:
         if args.command == "gui":
-            run_gui(settings, detection_error)
+            run_gui(settings)
         else:
             print(_format_lines(run()))
         return 0
