@@ -358,6 +358,13 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     canvas = None
     temperature_line = None
 
+    def show_status(message: str, *, color: str = "red") -> None:
+        """Update the status label text and color."""
+
+        status_var.set(message)
+        if status_label is not None:
+            status_label.configure(fg=color)
+
     def clear_temperature_plot() -> None:
         temperature_history.clear()
         if axes is None or canvas is None or temperature_line is None:
