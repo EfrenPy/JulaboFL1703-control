@@ -135,27 +135,56 @@ class JulaboChiller:
 
         self._query(f"out_sp_00 {value:.1f}")
 
+        # Read the setpoint back from the controller to confirm it has been
+        # applied.  The device echoes the setpoint with one decimal place, so
+        # compare within a small tolerance rather than relying on exact
+        # floating point equality.
+        confirmed_value = self.get_setpoint()
+        if abs(confirmed_value - value) > 0.05:
+            raise JulaboError(
+                "Julabo chiller did not acknowledge the requested setpoint. "
+                f"Expected {value:.2f} °C but read back {confirmed_value:.2f} °C."
+            )
+
     def get_temperature(self) -> float:
         """Return the current process temperature in °C."""
 
         response = self._query("in_pv_00")
         return float(response)
 
-    def set_running(self, start: bool) -> None:
-        """Start or stop the circulation pump."""
+    def set_running(self, start: bool) -> bool:
+        """Start or stop the circulation pump and confirm the new state."""
 
         value = 1 if start else 0
         self._query(f"out_mode_05 {value}")
 
-    def start(self) -> None:
+        confirmed = self.is_running()
+        if confirmed != start:
+            raise JulaboError(
+                "Julabo chiller did not acknowledge the requested cooling state. "
+                "Expected {} but read back {}.".format(
+                    "running" if start else "stopped",
+                    "running" if confirmed else "stopped",
+                )
+            )
+
+        return confirmed
+
+    def is_running(self) -> bool:
+        """Return ``True`` if the circulation pump is running."""
+
+        response = self._query("in_mode_05")
+        return response.strip() == "1"
+
+    def start(self) -> bool:
         """Convenience wrapper to start circulation."""
 
-        self.set_running(True)
+        return self.set_running(True)
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         """Convenience wrapper to stop circulation."""
 
-        self.set_running(False)
+        return self.set_running(False)
 
     def raw_command(self, command: str) -> str:
         """Send a raw command and return the response.
@@ -269,6 +298,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     import tkinter as tk
     from tkinter import messagebox
+    from tkinter import font as tkfont
 
     chiller: Optional[JulaboChiller] = None
     refresh_job: Optional[str] = None
@@ -276,6 +306,21 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     root = tk.Tk()
     root.title("Julabo Chiller Control")
+
+    # Bump the default fonts used by Tk so the interface is easier to read on
+    # high-DPI displays.
+    for font_name in (
+        "TkDefaultFont",
+        "TkTextFont",
+        "TkFixedFont",
+        "TkMenuFont",
+        "TkHeadingFont",
+        "TkTooltipFont",
+    ):
+        try:
+            tkfont.nametofont(font_name).configure(size=12)
+        except tk.TclError:
+            pass
 
     connection_error = startup_error
 
@@ -294,6 +339,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     setpoint_var = tk.StringVar(value="--")
     temp_var = tk.StringVar(value="--")
     status_var = tk.StringVar()
+    running_var = tk.BooleanVar(value=False)
 
     def cancel_refresh() -> None:
         nonlocal refresh_job
@@ -309,20 +355,35 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         refresh_job = None
         if chiller is None:
             status_var.set("Not connected to Julabo chiller.")
+            running_var.set(False)
             return
 
         try:
             setpoint = chiller.get_setpoint()
             temperature = chiller.get_temperature()
+            running = chiller.is_running()
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
             status_var.set(f"Error: {exc}")
         else:
             setpoint_var.set(f"{setpoint:.2f} °C")
             temp_var.set(f"{temperature:.2f} °C")
+            running_var.set(running)
+            update_running_button()
             status_var.set("")
         finally:
             if chiller is not None and root.winfo_exists():
                 refresh_job = root.after(5000, refresh_readings)
+
+    def update_running_button() -> None:
+        if chiller is None:
+            toggle_button.configure(state="disabled", text="Start cooling")
+            running_var.set(False)
+            return
+
+        toggle_button.configure(state="normal")
+        toggle_button.configure(
+            text="Stop cooling" if running_var.get() else "Start cooling"
+        )
 
     def set_connected(
         new_chiller: Optional[JulaboChiller], new_settings: Optional[SerialSettings]
@@ -346,12 +407,14 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         if chiller is not None:
             entry.configure(state="normal")
             apply_button.configure(state="normal")
+            update_running_button()
             entry.focus_set()
             refresh_readings()
         else:
             entry.configure(state="disabled")
             apply_button.configure(state="disabled")
             port_entry.focus_set()
+            update_running_button()
             status_var.set("Not connected to Julabo chiller.")
 
     def test_connection() -> None:
@@ -397,6 +460,22 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         else:
             status_var.set(f"Setpoint updated to {value:.2f} °C")
             entry_var.set("")
+            refresh_readings()
+
+    def toggle_running() -> None:
+        if chiller is None:
+            status_var.set("Not connected to Julabo chiller.")
+            return
+
+        target_state = not running_var.get()
+        try:
+            confirmed = chiller.set_running(target_state)
+        except Exception as exc:  # pragma: no cover - GUI runtime feedback
+            messagebox.showerror("Cooling control error", str(exc), parent=root)
+        else:
+            running_var.set(confirmed)
+            update_running_button()
+            status_var.set("Cooling started" if confirmed else "Cooling stopped")
 
     def on_close() -> None:
         if chiller is not None:
@@ -405,7 +484,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     root.protocol("WM_DELETE_WINDOW", on_close)
 
-    main_frame = tk.Frame(root, padx=12, pady=12)
+    main_frame = tk.Frame(root, padx=20, pady=20)
     main_frame.pack(fill=tk.BOTH, expand=True)
 
     tk.Label(main_frame, text="Serial port:").grid(row=0, column=0, sticky=tk.W)
@@ -428,8 +507,11 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     apply_button = tk.Button(main_frame, text="Apply", command=apply_setpoint)
     apply_button.grid(row=3, column=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
 
+    toggle_button = tk.Button(main_frame, text="Start cooling", command=toggle_running)
+    toggle_button.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+
     status_label = tk.Label(main_frame, textvariable=status_var, fg="red")
-    status_label.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+    status_label.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
 
     for child in main_frame.winfo_children():
         child.grid_configure(padx=4, pady=4)
