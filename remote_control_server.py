@@ -1,5 +1,4 @@
 """TCP server exposing Julabo chiller controls over the network."""
-from __future__ import annotations
 
 import argparse
 import json
