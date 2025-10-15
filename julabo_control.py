@@ -216,15 +216,29 @@ def _candidate_ports() -> Iterable[str]:
             seen.add(port_info.device)
             yield port_info.device
 
-    # Fall back to common Linux device name patterns in case pyserial does not
-    # enumerate the adapter for some reason.
-    import glob
+    # ``serial.tools.list_ports`` already supports Windows but on some
+    # configurations (notably when the USB adapter driver does not expose PnP
+    # information) it may return an empty list. Provide manual fallbacks that
+    # cover both Windows and POSIX device naming conventions so the automatic
+    # probing keeps working across platforms.
+    import sys
 
-    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyS*"):
-        for path in sorted(glob.glob(pattern)):
-            if path not in seen:
-                seen.add(path)
-                yield path
+    if sys.platform.startswith("win"):
+        # Windows COM ports start at 1. PySerial transparently handles the
+        # ``COM10`` style names so probing them directly is sufficient.
+        for index in range(1, 257):
+            port = f"COM{index}"
+            if port not in seen:
+                seen.add(port)
+                yield port
+    else:
+        import glob
+
+        for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyS*"):
+            for path in sorted(glob.glob(pattern)):
+                if path not in seen:
+                    seen.add(path)
+                    yield path
 
 
 def auto_detect_port(timeout: float) -> str:
