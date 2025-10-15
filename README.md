@@ -78,7 +78,5 @@ to send the update to the chiller.
 
 Launch the interface with `python -m julabo_control gui`. The program will
 reuse the last working port or search connected adapters until it reaches
-the chiller. If auto-detection fails the window still opens and shows the
-connection error so you can troubleshoot cabling or power without re-running
-the command. Once connected it continuously refreshes the display every five
-seconds.
+the chiller. Once connected it continuously refreshes the display every
+five seconds.
