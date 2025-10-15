@@ -349,6 +349,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     setpoint_var = tk.StringVar(value="--")
     temp_var = tk.StringVar(value="--")
     status_var = tk.StringVar()
+    status_label: Optional[tk.Label] = None
     running_var = tk.BooleanVar(value=False)
 
     temperature_history: List[Tuple[float, float]] = []
@@ -410,7 +411,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         nonlocal refresh_job
         refresh_job = None
         if chiller is None:
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
             running_var.set(False)
             clear_temperature_plot()
             return
@@ -420,7 +421,7 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             temperature = chiller.get_temperature()
             running = chiller.is_running()
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
-            status_var.set(f"Error: {exc}")
+            show_status(f"Error: {exc}")
         else:
             setpoint_var.set(f"{setpoint:.2f} °C")
             temp_var.set(f"{temperature:.2f} °C")
@@ -434,13 +435,13 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     def update_running_button() -> None:
         if chiller is None:
-            toggle_button.configure(state="disabled", text="Start cooling")
+            toggle_button.configure(state="disabled", text="Start machine")
             running_var.set(False)
             return
 
         toggle_button.configure(state="normal")
         toggle_button.configure(
-            text="Stop cooling" if running_var.get() else "Start cooling"
+            text="Stop machine" if running_var.get() else "Start machine"
         )
 
     def set_connected(
@@ -474,12 +475,12 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             apply_button.configure(state="disabled")
             port_entry.focus_set()
             update_running_button()
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
 
     def test_connection() -> None:
         port = port_var.get().strip()
         if not port:
-            status_var.set("Enter a serial port path.")
+            show_status("Enter a serial port path.")
             set_connected(None, None)
             return
 
@@ -493,23 +494,23 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
             messagebox.showerror("Connection error", str(exc), parent=root)
             set_connected(None, None)
         else:
-            status_var.set(f"Connected to {port}.")
+            show_status(f"Connected to {port}.", color="green")
             set_connected(tester, new_settings)
 
     def apply_setpoint() -> None:
         raw_value = entry_var.get().strip()
         if not raw_value:
-            status_var.set("Enter a temperature first.")
+            show_status("Enter a temperature first.")
             return
 
         if chiller is None:
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
             return
 
         try:
             value = float(raw_value)
         except ValueError:
-            status_var.set("Invalid temperature value.")
+            show_status("Invalid temperature value.")
             return
 
         try:
@@ -517,24 +518,27 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
             messagebox.showerror("Setpoint error", str(exc), parent=root)
         else:
-            status_var.set(f"Setpoint updated to {value:.2f} °C")
+            show_status(f"Setpoint updated to {value:.2f} °C", color="green")
             entry_var.set("")
             refresh_readings()
 
     def toggle_running() -> None:
         if chiller is None:
-            status_var.set("Not connected to Julabo chiller.")
+            show_status("Not connected to Julabo chiller.")
             return
 
         target_state = not running_var.get()
         try:
             confirmed = chiller.set_running(target_state)
         except Exception as exc:  # pragma: no cover - GUI runtime feedback
-            messagebox.showerror("Cooling control error", str(exc), parent=root)
+            messagebox.showerror("Machine control error", str(exc), parent=root)
         else:
             running_var.set(confirmed)
             update_running_button()
-            status_var.set("Cooling started" if confirmed else "Cooling stopped")
+            show_status(
+                "Machine started" if confirmed else "Machine stopped",
+                color="green",
+            )
 
     def on_close() -> None:
         if chiller is not None:
@@ -571,10 +575,10 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
     apply_button = tk.Button(main_frame, text="Apply", command=apply_setpoint)
     apply_button.grid(row=3, column=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
 
-    toggle_button = tk.Button(main_frame, text="Start cooling", command=toggle_running)
+    toggle_button = tk.Button(main_frame, text="Start machine", command=toggle_running)
     toggle_button.grid(row=4, column=0, columnspan=3, sticky=tk.W)
 
-    status_label = tk.Label(main_frame, textvariable=status_var, fg="red")
+    status_label = tk.Label(main_frame, textvariable=status_var, fg="black")
     status_label.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
 
     plot_frame = tk.LabelFrame(main_frame, text="Temperature trend", padx=10, pady=10)
@@ -622,10 +626,10 @@ def run_gui(settings: Optional[SerialSettings], *, startup_error: Optional[BaseE
 
     if chiller is not None:
         set_connected(chiller, settings)
-        status_var.set("")
+        show_status("", color="black")
     else:
         set_connected(None, None)
-        status_var.set("Connect the Julabo chiller and press Test connection.")
+        show_status("Connect the Julabo chiller and press Test connection.")
 
     try:
         root.mainloop()
