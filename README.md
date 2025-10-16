@@ -4,20 +4,26 @@ Comprehensive utilities for operating a Julabo recirculating chiller from Python
 project bundles a reusable library, a command-line interface, a local desktop GUI, and a
 small TCP service with a remote GUI client.
 
+## Additional resources
+
+* [Repository on GitHub](https://github.com/EfrenPy/Julabo-control)
+* [Confluence space](https://example.com/display/RDT11/Julabo+Chiller+control)
+
 ## Project layout
 
 ```
 Julabo-control/
-├── julabo_control/        # Reusable Python package
-│   ├── core.py            # Serial helpers and JulaboChiller implementation
-│   ├── gui.py             # Local Tk interface built on top of the core module
-│   ├── ui.py              # Shared Tk/matplotlib utilities
-│   ├── cli.py             # Command line entrypoint (``python -m julabo_control``)
-│   └── __main__.py        # Thin wrapper that dispatches to ``cli.main``
-├── remote_client.py       # Tk GUI that talks to a remote Julabo server
+├── julabo_control/           # Reusable Python package
+│   ├── core.py               # Serial helpers and JulaboChiller implementation
+│   ├── gui.py                # Local Tk interface built on top of the core module
+│   ├── ui.py                 # Shared Tk/matplotlib utilities
+│   ├── cli.py                # Command line entrypoint (``python -m julabo_control``)
+│   └── __main__.py           # Thin wrapper that dispatches to ``cli.main``
+├── remote_client.py          # Tk GUI that talks to a remote Julabo server
 ├── remote_control_server.py  # TCP JSON server exposing Julabo commands
-├── requirements.txt       # Runtime dependencies (PySerial + matplotlib)
-└── README.md              # This guide
+├── requirements.txt          # Runtime dependencies (PySerial + matplotlib)
+├── Julabo_FL1703_manual.pdf  # Official user manual (for reference)
+└── README.md                 # This guide
 ```
 
 The code is structured so that all shared logic (serial communication, GUI helpers, font
