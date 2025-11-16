@@ -18,7 +18,7 @@ Consult your device's manual to verify protocol compatibility. The included
 
 ## Additional resources
 
-* [Repository on GitHub](https://github.com/EfrenPy/Julabo-control)
+* [Repository on GitHub](https://github.com/EfrenPy/JulaboFL1703-control)
 
 ## Project layout
 
