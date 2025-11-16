@@ -4,10 +4,21 @@ Comprehensive utilities for operating a Julabo recirculating chiller from Python
 project bundles a reusable library, a command-line interface, a local desktop GUI, and a
 small TCP service with a remote GUI client.
 
+## Compatibility
+
+This control suite was developed specifically for the **Julabo FL1703** recirculating
+chiller. However, it can be easily adapted to work with other Julabo models that use the
+same serial communication protocol (ASCII-based commands over RS232 with 4800 baud, 7
+data bits, even parity, 1 stop bit, and RTS/CTS flow control).
+
+If your Julabo model supports the same command set (`in_sp_00`, `out_sp_00`, `in_pv_00`,
+`in_mode_05`, `out_mode_05`, etc.), this software should work without modification.
+Consult your device's manual to verify protocol compatibility. The included
+`Julabo_FL1703_manual.pdf` can serve as a reference for the communication protocol.
+
 ## Additional resources
 
 * [Repository on GitHub](https://github.com/EfrenPy/Julabo-control)
-* [Confluence space](https://example.com/display/RDT11/Julabo+Chiller+control)
 
 ## Project layout
 
@@ -141,7 +152,7 @@ python remote_control_server.py --host 0.0.0.0 --port 8765
 ### Client
 
 ```bash
-python remote_client.py --host localhost --port 8765
+python remote_client.py --host server.example.com --port 8765
 ```
 
 The client defaults to `localhost` when no host is provided.  Use `--host` to
