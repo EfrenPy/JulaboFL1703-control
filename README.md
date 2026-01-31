@@ -4,6 +4,26 @@ Comprehensive utilities for operating a Julabo recirculating chiller from Python
 project bundles a reusable library, a command-line interface, a local desktop GUI, and a
 small TCP service with a remote GUI client.
 
+## Examples
+
+The built-in GUI records live temperature readings and plots them over time.
+Below are example plots generated with simulated data to illustrate typical
+usage scenarios.
+
+### Cooling to a setpoint
+
+![Setpoint tracking](docs/images/setpoint_tracking.png)
+
+### Steady-state monitoring
+
+![Temperature monitoring](docs/images/temperature_monitoring.png)
+
+### Multi-step setpoint programme
+
+![Setpoint steps](docs/images/setpoint_steps.png)
+
+These plots can be regenerated with `python3 generate_example_plots.py`.
+
 ## Compatibility
 
 This control suite was developed specifically for the **Julabo FL1703** recirculating
