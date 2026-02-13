@@ -83,7 +83,6 @@ Thank you for your interest in contributing to Julabo Control! This document pro
 ### Documentation
 
 - Update README.md if adding new features
-- Update CLAUDE.md for architectural changes
 - Add docstrings to new functions/classes
 - Include inline comments for complex logic
 
