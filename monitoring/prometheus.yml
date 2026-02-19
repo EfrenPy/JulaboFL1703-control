@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: julabo
+    static_configs:
+      - targets:
+          - julabo-server:9100

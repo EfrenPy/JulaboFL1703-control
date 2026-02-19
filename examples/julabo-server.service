@@ -1,0 +1,23 @@
+[Unit]
+Description=Julabo FL1703 TCP Control Server
+After=network.target
+Documentation=https://github.com/EfrenPy/JulaboFL1703-control
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/julabo-server
+EnvironmentFile=-/etc/julabo/environment
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/dev/ttyUSB0
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
