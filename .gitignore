@@ -18,6 +18,8 @@ build/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
+.coverage
 
 # IDE / editor
 .vscode/
