@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "julabo-control"
+version = "0.8.0"
+description = "Control suite for Julabo FL1703 recirculating chillers"
+requires-python = ">=3.9"
+license = "MIT"
+readme = "README.md"
+dependencies = [
+    "matplotlib>=3.7",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+mqtt = [
+    "paho-mqtt>=1.6",
+]
+websocket = [
+    "websockets>=11.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21",
+    "mypy>=1.0",
+    "ruff>=0.1",
+    "hypothesis>=6.0",
+    "paho-mqtt>=1.6",
+    "websockets>=11.0",
+]
+
+[project.scripts]
+julabo = "julabo_control.cli:main"
+julabo-server = "julabo_control.remote_server:main"
+julabo-remote = "julabo_control.remote_client:main"
+julabo-simulator = "julabo_control.simulator:main"
+julabo-web = "julabo_control.web:main"
+julabo-server-async = "julabo_control.async_server:main"
+julabo-mqtt = "julabo_control.mqtt_bridge:main"
+
+[tool.setuptools.packages.find]
+include = ["julabo_control*"]
+
+[tool.setuptools.package-data]
+julabo_control = ["py.typed"]
+
+[tool.mypy]
+ignore_missing_imports = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["julabo_control"]
+
+[tool.coverage.report]
+show_missing = true
