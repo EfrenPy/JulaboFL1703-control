@@ -14,7 +14,7 @@ Thank you for your interest in contributing to Julabo Control! This document pro
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
+   pip install -e .[dev]
    ```
 
 ## How to Contribute
@@ -48,28 +48,48 @@ Thank you for your interest in contributing to Julabo Control! This document pro
    - Add comments where necessary
    - Update documentation if needed
 
-3. Test your changes:
+3. Run the quality checks (all must pass before opening a PR):
+   ```bash
+   ruff check julabo_control/ tests/        # linting
+   mypy julabo_control/                      # type checking
+   pytest tests/ --ignore=tests/test_e2e_simulator.py \
+       --cov=julabo_control --cov-fail-under=90 -q   # tests + coverage gate
+   pytest tests/test_e2e_simulator.py -v     # E2E simulator tests
+   ```
+
+4. Test your changes:
    - Ensure the CLI commands still work
    - Test the GUI if you modified it
    - Test remote server/client if applicable
    - Verify compatibility with the Julabo serial protocol
 
-4. Commit your changes:
+5. Commit your changes:
    ```bash
    git add .
    git commit -m "Brief description of your changes"
    ```
 
-5. Push to your fork:
+6. Push to your fork:
    ```bash
    git push origin feature/your-feature-name
    ```
 
-6. Open a Pull Request on GitHub with:
+7. Open a Pull Request on GitHub with:
    - A clear title and description
    - Reference to any related issues
    - Summary of changes made
    - Testing performed
+
+## Pre-PR Checklist
+
+Before submitting a pull request, verify:
+
+- [ ] `ruff check julabo_control/ tests/` passes with no errors
+- [ ] `mypy julabo_control/` passes with no errors
+- [ ] `pytest` passes with **>90% coverage** (CI enforced)
+- [ ] E2E simulator tests pass (`pytest tests/test_e2e_simulator.py -v`)
+- [ ] New features include tests
+- [ ] CHANGELOG.md updated (if user-facing)
 
 ## Code Guidelines
 
