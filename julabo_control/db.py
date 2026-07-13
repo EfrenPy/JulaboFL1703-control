@@ -68,6 +68,17 @@ class TemperatureDB:
                 )
             return [dict(row) for row in cursor.fetchall()]
 
+    def purge_older_than(self, days: float) -> int:
+        """Delete readings older than ``days``; returns the number removed."""
+        cutoff = time.time() - days * 86400
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM temperature_readings WHERE timestamp < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
     def close(self) -> None:
         """Close the database connection."""
         with self._lock:

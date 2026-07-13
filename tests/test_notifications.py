@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from julabo_control.notifications import (
     _escape_applescript,
-    _escape_xml,
+    _escape_powershell_single_quoted,
     send_desktop_notification,
 )
 
@@ -27,22 +27,20 @@ class TestEscapeApplescript:
         assert "\\" in result or result == '\\"; rm -rf /'
 
 
-class TestEscapeXml:
+class TestEscapePowerShell:
     def test_plain_text(self) -> None:
-        assert _escape_xml("hello") == "hello"
+        assert _escape_powershell_single_quoted("hello") == "hello"
 
-    def test_ampersand(self) -> None:
-        assert _escape_xml("a & b") == "a &amp; b"
+    def test_single_quote_doubled(self) -> None:
+        assert _escape_powershell_single_quoted("it's") == "it''s"
 
-    def test_angle_brackets(self) -> None:
-        assert _escape_xml("<script>") == "&lt;script&gt;"
+    def test_xml_chars_passed_through(self) -> None:
+        # CreateTextNode sets text content; special chars are NOT entity-escaped.
+        assert _escape_powershell_single_quoted("<a> & b") == "<a> & b"
 
-    def test_quotes(self) -> None:
-        assert _escape_xml("it's \"fine\"") == "it&apos;s &quot;fine&quot;"
-
-    def test_all_special_chars(self) -> None:
-        result = _escape_xml('<>&\'"')
-        assert result == "&lt;&gt;&amp;&apos;&quot;"
+    def test_injection_quote_neutralized(self) -> None:
+        result = _escape_powershell_single_quoted("'; rm -rf /")
+        assert result == "''; rm -rf /"
 
 
 class TestDesktopNotification:
@@ -109,17 +107,36 @@ class TestDesktopNotification:
 
     @patch("julabo_control.notifications.sys")
     @patch("julabo_control.notifications.subprocess")
-    def test_win32_escapes_xml_chars(
+    def test_win32_preserves_text_content(
         self, mock_subprocess: MagicMock, mock_sys: MagicMock
     ) -> None:
         mock_sys.platform = "win32"
         mock_subprocess.SubprocessError = _sp.SubprocessError
 
+        # CreateTextNode sets XML text content, so special chars are passed
+        # through literally (the DOM escapes on serialization) rather than as
+        # entity codes.
         send_desktop_notification("<script>alert</script>", "a & b")
         call_kwargs = mock_subprocess.run.call_args
         ps_cmd = call_kwargs[0][0][2]  # powershell -Command <script>
-        assert "&lt;script&gt;" in ps_cmd
-        assert "&amp;" in ps_cmd
+        assert "<script>alert</script>" in ps_cmd
+        assert "a & b" in ps_cmd
+
+    @patch("julabo_control.notifications.sys")
+    @patch("julabo_control.notifications.subprocess")
+    def test_win32_escapes_single_quotes(
+        self, mock_subprocess: MagicMock, mock_sys: MagicMock
+    ) -> None:
+        mock_sys.platform = "win32"
+        mock_subprocess.SubprocessError = _sp.SubprocessError
+
+        # A single quote must be doubled so it cannot break out of the
+        # PowerShell single-quoted string literal.
+        send_desktop_notification("it's", "o'clock")
+        call_kwargs = mock_subprocess.run.call_args
+        ps_cmd = call_kwargs[0][0][2]
+        assert "it''s" in ps_cmd
+        assert "o''clock" in ps_cmd
 
     @patch("julabo_control.notifications.subprocess")
     @patch("julabo_control.notifications.sys")

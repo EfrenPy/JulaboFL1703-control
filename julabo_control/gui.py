@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from typing import Callable
 
 import serial
 
@@ -52,6 +54,8 @@ class ChillerApp(BaseChillerApp):
         self._reconnect_delay_max = 30.0
         self._reconnect_delay_factor = 2.0
         self._schedule_runner: ScheduleRunner | None = None
+        self._desktop_notifications = desktop_notifications
+        self._comms_lost = False
 
         root.title("Julabo Chiller Control")
         configure_default_fonts(font_size)
@@ -76,6 +80,9 @@ class ChillerApp(BaseChillerApp):
             on_clear=self._on_clear,
             desktop_notifications=desktop_notifications,
             log_file=alarm_log,
+            # Deliver notifications off the Tk event loop so a slow desktop
+            # toast / Alertmanager POST cannot freeze the UI.
+            async_notifications=True,
         )
 
         self._build_layout()
@@ -143,28 +150,28 @@ class ChillerApp(BaseChillerApp):
             )
             return
 
+        candidate = SerialSettings(port=port, timeout=self._timeout_value)
+        new_conn = JulaboChiller(candidate)
         try:
-            candidate = SerialSettings(port=port, timeout=self._timeout_value)
-            with JulaboChiller(candidate) as new_chiller:
-                new_chiller.identify()
+            # Open once and keep the connection: closing and immediately
+            # reopening the same device can spuriously fail on USB-serial
+            # adapters that need a settling delay between close and open.
+            new_conn.connect()
+            new_conn.identify()
         except (  # pragma: no cover
             serial.SerialException, OSError, TimeoutError, JulaboError,
         ) as exc:
+            try:
+                new_conn.close()
+            except (serial.SerialException, OSError):
+                pass
             messagebox.showerror("Connection error", str(exc), parent=self.root)
             self._show_status(f"Connection error: {exc}")
             self.set_connected(None, None)
         else:
             LOGGER.info("Connection test passed for %s", port)
             self._show_status("Connected", color="green")
-            new_conn = JulaboChiller(candidate)
-            try:
-                new_conn.connect()
-            except (serial.SerialException, OSError, TimeoutError) as exc:  # pragma: no cover
-                messagebox.showerror("Connection error", str(exc), parent=self.root)
-                self._show_status(f"Connection error: {exc}")
-                self.set_connected(None, None)
-            else:
-                self.set_connected(new_conn, candidate)
+            self.set_connected(new_conn, candidate)
 
     # -- Polling & data --
 
@@ -180,9 +187,10 @@ class ChillerApp(BaseChillerApp):
             setpoint = self._chiller.get_setpoint()
             temperature = self._chiller.get_temperature()
             running = self._chiller.is_running()
-        except (JulaboError, TimeoutError, serial.SerialException, OSError) as exc:
+        except (JulaboError, TimeoutError, ValueError, serial.SerialException, OSError) as exc:
             LOGGER.error("Error reading from chiller: %s", exc)
             self._show_status(f"Error: {exc}")
+            self._signal_comms_lost(exc)
             if self._current_settings is not None:
                 try:
                     self._chiller.close()
@@ -213,6 +221,7 @@ class ChillerApp(BaseChillerApp):
             self.alarm.threshold = self.alarm_threshold_var.get()
             self.alarm.check(temperature, setpoint)
             self._tick_schedule()
+            self._clear_comms_lost()
             self._reconnect_delay = 1.0
         finally:
             if self.root.winfo_exists():
@@ -476,21 +485,66 @@ class ChillerApp(BaseChillerApp):
             y_offset = max((self.root.winfo_screenheight() - height) // 2, 0)
             self.root.geometry(f"+{x_offset}+{y_offset}")
 
+    def _signal_comms_lost(self, exc: Exception) -> None:
+        """Raise a distinct alarm the first time communication drops.
+
+        A comms failure otherwise silently stops temperature-deviation
+        monitoring, so treat it as its own escalated condition (bell + optional
+        desktop notification + alarm audit log), fired once per outage.
+        """
+        if self._comms_lost:
+            return
+        self._comms_lost = True
+        LOGGER.warning("Communication with chiller lost: %s", exc)
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+        self.alarm._log_event("COMMS_LOST", float("nan"), float("nan"))
+        if self._desktop_notifications:
+            def _notify() -> None:
+                from .notifications import send_desktop_notification
+
+                send_desktop_notification(
+                    "Julabo Communication Lost",
+                    f"Lost contact with the chiller: {exc}",
+                )
+
+            threading.Thread(target=_notify, daemon=True).start()
+
+    def _clear_comms_lost(self) -> None:
+        """Clear the comms-lost condition after a successful read."""
+        if not self._comms_lost:
+            return
+        self._comms_lost = False
+        LOGGER.info("Communication with chiller restored")
+        self.alarm._log_event("COMMS_RESTORED", float("nan"), float("nan"))
+
     def on_close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._cancel_refresh()
-        self._stop_flash()
+
+        # Run each shutdown step in isolation so one failure (e.g. an OSError
+        # closing a log on a full disk) cannot prevent the serial port from
+        # being released or the window from being destroyed.
+        def _safe(step: Callable[[], None], what: str) -> None:
+            try:
+                step()
+            except Exception:
+                LOGGER.exception("Error during shutdown step: %s", what)
+
+        _safe(self._cancel_refresh, "cancel refresh")
+        _safe(self._stop_flash, "stop flash")
         if self._schedule_runner is not None:
-            self._schedule_runner.stop()
+            _safe(self._schedule_runner.stop, "stop schedule")
             self._schedule_runner = None
         if self.temperature_logger is not None:
-            self.temperature_logger.close()
-        self.alarm.close()
+            _safe(self.temperature_logger.close, "close temperature logger")
+        _safe(self.alarm.close, "close alarm")
         if self._chiller is not None:
-            self._chiller.close()
-        self.root.destroy()
+            _safe(self._chiller.close, "close chiller")
+        _safe(self.root.destroy, "destroy window")
 
 
 def run_gui(

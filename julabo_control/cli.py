@@ -9,7 +9,7 @@ from collections.abc import Iterable, Sequence
 import serial
 
 from . import __version__
-from .config import load_config
+from .config import get_float, get_int, load_config
 from .core import (
     DEFAULT_TIMEOUT,
     JulaboChiller,
@@ -71,7 +71,7 @@ def _run_monitor(
                     temperature = chiller.get_temperature()
                     setpoint = chiller.get_setpoint()
                     running = chiller.is_running()
-                except (JulaboError, TimeoutError, serial.SerialException) as exc:
+                except (JulaboError, TimeoutError, ValueError, serial.SerialException) as exc:
                     LOGGER.error("Read error: %s", exc)
                     time.sleep(interval)
                     continue
@@ -223,6 +223,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     raw_parser = subparsers.add_parser("send", help="Send a raw command string")
     raw_parser.add_argument("raw_command", help="Command to send, e.g. 'in_sp_00'")
+    raw_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow raw setpoint/mode-changing commands (out_sp_00, out_mode_05) "
+            "that bypass the built-in safety validation. Use with caution."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -239,7 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     timeout = (
         args.timeout
         if args.timeout is not None
-        else float(serial_cfg.get("timeout", str(DEFAULT_TIMEOUT)))
+        else get_float(serial_cfg, "timeout", DEFAULT_TIMEOUT, min_val=0.1)
     )
 
     if args.command == "forget-port":
@@ -254,12 +263,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raw_poll = getattr(args, "poll_interval", None)
         poll_interval: int = (
             raw_poll if raw_poll is not None
-            else int(gui_cfg.get("poll_interval", "5000"))
+            else get_int(gui_cfg, "poll_interval", 5000, min_val=100)
         )
         raw_threshold = getattr(args, "alarm_threshold", None)
         alarm_threshold: float = (
             raw_threshold if raw_threshold is not None
-            else float(gui_cfg.get("alarm_threshold", "2.0"))
+            else get_float(gui_cfg, "alarm_threshold", 2.0, min_val=0.0)
         )
         temp_log: str | None = (
             getattr(args, "temperature_log", None) or gui_cfg.get("temperature_log")
@@ -271,10 +280,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             getattr(args, "alarm_log", None) or gui_cfg.get("alarm_log")
         )
         font_size: int | None = getattr(args, "font_size", None)
-        if font_size is None:
-            raw_font = gui_cfg.get("font_size")
-            if raw_font is not None:
-                font_size = int(raw_font)
+        if font_size is None and gui_cfg.get("font_size") is not None:
+            font_size = get_int(gui_cfg, "font_size", 0, min_val=1)
+            if font_size == 0:
+                font_size = None
         if port:
             run_gui(
                 SerialSettings(port=port, timeout=timeout),
@@ -338,6 +347,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 chiller.stop()
                 yield "Chiller stopped"
             elif args.command == "send":
+                stripped = args.raw_command.strip().lower()
+                unsafe = stripped.startswith(("out_sp_00", "out_mode_05"))
+                if unsafe and not getattr(args, "force", False):
+                    raise ValueError(
+                        "Refusing to send a raw setpoint/mode command that bypasses "
+                        "safety validation. Use the 'set-setpoint'/'start'/'stop' "
+                        "commands, or pass --force to override."
+                    )
                 yield chiller.raw_command(args.raw_command)
             else:  # pragma: no cover - defensive programming
                 raise AssertionError(f"Unknown command: {args.command}")
@@ -345,6 +362,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         print(_format_lines(run()))
         return 0
-    except (JulaboError, TimeoutError, serial.SerialException) as exc:
+    except (JulaboError, TimeoutError, ValueError, serial.SerialException) as exc:
         parser.error(str(exc))
         return 2

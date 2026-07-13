@@ -195,6 +195,16 @@ class TestAuthentication:
         assert result["status"] == "ok"
         assert result["result"] == "JULABO FL1703"
 
+    def test_non_string_token_rejected(self, authed_server: JulaboTCPServer) -> None:
+        """A non-str token must not crash compare_digest; it is rejected."""
+        with pytest.raises(PermissionError, match="Invalid or missing"):
+            authed_server.process_command({"command": "identify", "token": 12345})
+
+    def test_non_dict_payload_rejected(self, server: JulaboTCPServer) -> None:
+        """A JSON array/scalar must raise ValueError, not AttributeError."""
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            server.process_command([1, 2, 3])  # type: ignore[arg-type]
+
 
 class TestStatusAll:
     def test_status_all(self, server: JulaboTCPServer) -> None:

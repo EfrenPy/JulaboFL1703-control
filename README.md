@@ -171,8 +171,13 @@ auth_token = my-secret-token
 [web]
 host = localhost
 port = 8765
-web_host = 0.0.0.0
+web_host = 127.0.0.1
 web_port = 8080
+# Require a token on all dashboard API/WebSocket requests. Strongly recommended
+# whenever web_host is not 127.0.0.1, since every API route can control the chiller.
+web_auth_token = my-web-secret
+# Optional: persist temperature history to SQLite and enable the history view.
+db_path = /var/lib/julabo/history.db
 
 [mqtt]
 broker = mqtt.example.com
@@ -342,7 +347,22 @@ julabo-server --tls-cert server.pem --tls-key server.key
 julabo-remote --tls server.example.com
 ```
 
-Use `--tls-ca` on the client to verify the server certificate against a custom CA.
+The async server also accepts `--tls-cert`/`--tls-key`.
+
+To authenticate the server, the client should either verify against a CA or pin
+the certificate:
+
+```bash
+# Verify against a custom CA
+julabo-remote --tls --tls-ca ca.pem server.example.com
+
+# Or pin a self-signed certificate by its SHA-256 fingerprint
+julabo-remote --tls --tls-fingerprint AB:CD:... server.example.com
+```
+
+`--tls` **without** `--tls-ca` or `--tls-fingerprint` encrypts the connection but
+does not authenticate the server (vulnerable to MITM); the client logs a warning
+in that case.
 
 ### Rate limiting
 
@@ -430,6 +450,17 @@ Open `http://localhost:8080` to see live temperature readings, a Chart.js histor
 chart, and controls for setpoint, start, and stop. The dashboard auto-refreshes every
 five seconds and proxies commands through the TCP server.
 
+> **Security:** the web server binds to `127.0.0.1` (localhost only) by default.
+> Every `/api/*` route can control the physical chiller, so if you expose it on a
+> network (`--web-host 0.0.0.0`) you should require a token with
+> `--web-auth-token <secret>`. Clients pass it via the `X-Auth-Token` header or a
+> `?token=` query parameter (append `?token=<secret>` to the dashboard URL); the
+> server logs a warning if it is bound off-localhost without one.
+
+Optional flags: `--web-auth-token <secret>` to require authentication, and
+`--db-path <file>` to persist temperature history to SQLite (populating the
+history view).
+
 Features:
 
 * **Server-Sent Events** for real-time status updates (falls back to polling)
@@ -446,9 +477,16 @@ Publish chiller telemetry to an MQTT broker and subscribe to command topics:
 
 ```bash
 julabo-mqtt --broker mqtt.example.com --host server.local
+
+# Encrypt the broker connection (recommended whenever credentials are used)
+julabo-mqtt --broker mqtt.example.com --mqtt-tls --mqtt-tls-ca ca.pem \
+  --mqtt-username user --mqtt-password secret
 ```
 
-Requires `pip install julabo-control[mqtt]`.
+Requires `pip install julabo-control[mqtt]`. TLS is enabled before credentials
+are sent; the bridge warns if a username/password is configured without
+`--mqtt-tls`. Because any client that can publish to `<prefix>/command/#` can
+control the chiller, restrict those topics with broker-side ACLs.
 
 ### Docker
 

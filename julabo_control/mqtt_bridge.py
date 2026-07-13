@@ -27,6 +27,9 @@ class MQTTBridge:
         publish_interval: float = 5.0,
         username: str | None = None,
         password: str | None = None,
+        tls: bool = False,
+        tls_ca: str | None = None,
+        tls_insecure: bool = False,
     ) -> None:
         import paho.mqtt.client as mqtt_mod
 
@@ -37,6 +40,17 @@ class MQTTBridge:
         self.publish_interval = publish_interval
 
         self._mqtt = mqtt_mod.Client()
+        # Enable TLS before setting credentials so username/password are never
+        # sent over an unencrypted channel.
+        if tls or tls_ca:
+            self._mqtt.tls_set(ca_certs=tls_ca)
+            if tls_insecure:
+                self._mqtt.tls_insecure_set(True)
+        elif username:
+            LOGGER.warning(
+                "MQTT username/password configured without TLS: credentials "
+                "will be sent to the broker in cleartext. Enable --mqtt-tls."
+            )
         if username:
             self._mqtt.username_pw_set(username, password)
         self._mqtt.on_message = self._on_message
@@ -109,6 +123,18 @@ def main() -> None:  # pragma: no cover - CLI helper
     )
     parser.add_argument("--mqtt-username", default=None, help="MQTT username")
     parser.add_argument("--mqtt-password", default=None, help="MQTT password")
+    parser.add_argument(
+        "--mqtt-tls", action="store_true", default=False,
+        help="Encrypt the broker connection with TLS",
+    )
+    parser.add_argument(
+        "--mqtt-tls-ca", default=None,
+        help="CA certificate file for verifying the broker (implies --mqtt-tls)",
+    )
+    parser.add_argument(
+        "--mqtt-tls-insecure", action="store_true", default=False,
+        help="Skip broker certificate hostname verification (use with caution)",
+    )
     parser.add_argument("--host", default=None, help="TCP server host (default: localhost)")
     parser.add_argument("--port", type=int, default=None, help="TCP server port (default: 8765)")
     parser.add_argument("--auth-token", default=None, help="Auth token for the TCP server")
@@ -130,6 +156,12 @@ def main() -> None:  # pragma: no cover - CLI helper
     )
     username = args.mqtt_username or mqtt_cfg.get("username")
     password = args.mqtt_password or mqtt_cfg.get("password")
+    tls = args.mqtt_tls or mqtt_cfg.get("tls", "").lower() in ("1", "true", "yes")
+    tls_ca = args.mqtt_tls_ca or mqtt_cfg.get("tls_ca")
+    tls_insecure = (
+        args.mqtt_tls_insecure
+        or mqtt_cfg.get("tls_insecure", "").lower() in ("1", "true", "yes")
+    )
 
     host = args.host or mqtt_cfg.get("host", "localhost")
     port = args.port if args.port is not None else int(mqtt_cfg.get("server_port", "8765"))
@@ -144,6 +176,7 @@ def main() -> None:  # pragma: no cover - CLI helper
     bridge = MQTTBridge(
         client, broker, port=mqtt_port, topic_prefix=topic_prefix,
         publish_interval=publish_interval, username=username, password=password,
+        tls=tls, tls_ca=tls_ca, tls_insecure=tls_insecure,
     )
     bridge.start()
     LOGGER.info("MQTT bridge running. Press Ctrl+C to stop.")

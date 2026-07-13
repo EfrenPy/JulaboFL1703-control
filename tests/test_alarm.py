@@ -57,6 +57,44 @@ class TestTemperatureAlarm:
         alarm.check(20.0, 20.0)
         assert alarm.is_alarming is False
 
+    def test_hysteresis_holds_state_in_deadband(self) -> None:
+        # Explicit deadband: engage above 2.0, clear only below 2.0 - 0.5 = 1.5.
+        alarm = TemperatureAlarm(threshold=2.0, hysteresis=0.5)
+        assert alarm.check(23.0, 20.0) is True  # deviation 3.0 → alarm
+        # Deviation 1.8 is inside the deadband (1.5, 2.0]; state must hold.
+        assert alarm.check(21.8, 20.0) is True
+        # Deviation 1.4 is below the clear threshold → clears.
+        assert alarm.check(21.4, 20.0) is False
+
+    def test_default_hysteresis_is_ten_percent(self) -> None:
+        alarm = TemperatureAlarm(threshold=2.0)  # clear threshold 1.8
+        assert alarm.check(23.0, 20.0) is True
+        assert alarm.check(21.9, 20.0) is True   # 1.9 in deadband → hold
+        assert alarm.check(21.7, 20.0) is False  # 1.7 < 1.8 → clear
+
+    def test_async_notifications_dispatch_off_thread(self) -> None:
+        import threading as _threading
+
+        calls: list[str] = []
+        main_thread = _threading.current_thread()
+
+        class _AM:
+            def send_firing(self, *a: object) -> None:
+                calls.append(_threading.current_thread() is main_thread and "main" or "bg")
+
+            def send_resolved(self, *a: object) -> None:  # pragma: no cover
+                pass
+
+        alarm = TemperatureAlarm(
+            threshold=1.0, alertmanager_client=_AM(), async_notifications=True
+        )
+        alarm.check(25.0, 20.0)
+        # Give the daemon thread a moment to run.
+        for t in _threading.enumerate():
+            if t is not main_thread and t.daemon:
+                t.join(timeout=1.0)
+        assert calls == ["bg"]
+
     def test_disable_clears_active_alarm(self) -> None:
         cleared = []
         alarm = TemperatureAlarm(

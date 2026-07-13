@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import configparser
 import logging
+import os
+import stat
 from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".julabo_control.ini"
+
+# Sections whose keys may contain secrets (auth tokens, passwords).
+_SECRET_KEYS = {"auth_token", "password"}
 
 KNOWN_SECTIONS: dict[str, set[str]] = {
     "serial": {"port", "baudrate", "timeout"},
@@ -48,6 +53,7 @@ KNOWN_SECTIONS: dict[str, set[str]] = {
         "auth_token",
         "tls",
         "tls_ca",
+        "tls_fingerprint",
         "alarm_log",
         "temperature_log",
         "desktop_notifications",
@@ -59,7 +65,9 @@ KNOWN_SECTIONS: dict[str, set[str]] = {
         "web_host",
         "web_port",
         "auth_token",
+        "web_auth_token",
         "db_path",
+        "record_interval",
     },
     "mqtt": {
         "broker",
@@ -71,6 +79,9 @@ KNOWN_SECTIONS: dict[str, set[str]] = {
         "host",
         "server_port",
         "auth_token",
+        "tls",
+        "tls_ca",
+        "tls_insecure",
     },
 }
 
@@ -174,8 +185,10 @@ def load_config(path: Path | None = None) -> dict[str, dict[str, str]]:
     parser = configparser.ConfigParser()
     try:
         parser.read(str(path), encoding="utf-8")
-    except configparser.Error as exc:
-        LOGGER.warning("Failed to parse config file %s: %s", path, exc)
+    except (configparser.Error, OSError) as exc:
+        # Malformed content, permission denied, or any I/O error: degrade to
+        # defaults rather than crashing every entry point.
+        LOGGER.warning("Failed to read config file %s: %s", path, exc)
         return {}
 
     result: dict[str, dict[str, str]] = {}
@@ -183,4 +196,28 @@ def load_config(path: Path | None = None) -> dict[str, dict[str, str]]:
         result[section] = dict(parser[section])
     LOGGER.debug("Loaded config from %s: sections=%s", path, list(result.keys()))
     _validate_config(result)
+    _warn_on_insecure_secret_permissions(path, result)
     return result
+
+
+def _warn_on_insecure_secret_permissions(
+    path: Path, config: dict[str, dict[str, str]]
+) -> None:
+    """Warn if the config holds secrets but is group/world-readable."""
+    has_secret = any(
+        key in _SECRET_KEYS and value
+        for section in config.values()
+        for key, value in section.items()
+    )
+    if not has_secret:
+        return
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        LOGGER.warning(
+            "Config file %s contains secrets but is accessible to group/other "
+            "(mode %o); restrict it with `chmod 600 %s`.",
+            path, stat.S_IMODE(mode), path,
+        )

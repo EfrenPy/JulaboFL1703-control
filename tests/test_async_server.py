@@ -73,6 +73,26 @@ class TestAsyncServer:
         assert resp["status"] == "error"
         assert "authentication" in resp["error"].lower()
 
+    async def test_async_non_string_token_rejected(self, async_server) -> None:
+        server, _ = async_server
+        resp = await _send_recv(
+            server.port, {"command": "ping", "token": 123},
+        )
+        assert resp["status"] == "error"
+        assert "authentication" in resp["error"].lower()
+
+    async def test_async_non_dict_payload_rejected(self, async_server) -> None:
+        server, _ = async_server
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        writer.write(json.dumps([1, 2, 3]).encode() + b"\n")
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+        resp = json.loads(raw)
+        assert resp["status"] == "error"
+        assert "json object" in resp["error"].lower()
+
     async def test_async_rate_limit(self) -> None:
         chiller = FakeChillerBackend(noise=0.0)
         server = AsyncJulaboServer(

@@ -13,6 +13,8 @@ import pytest
 from julabo_control.remote_client import (
     RemoteChillerApp,
     RemoteChillerClient,
+    _normalize_fingerprint,
+    _verify_cert_fingerprint,
     parse_args,
 )
 from julabo_control.remote_server import resolve_auth_token
@@ -301,6 +303,115 @@ class TestPersistentConnection:
         )
         client.close()
         client.close()  # Should not raise
+
+
+class _CountingListener:
+    """Accepts connections and counts how many raw sockets it received."""
+
+    def __init__(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(5)
+        self.port = self._sock.getsockname()[1]
+        self.accepted = 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        self._sock.settimeout(0.2)
+        while not self._stop:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                continue
+            self.accepted += 1
+            conn.close()
+
+    def close(self) -> None:
+        self._stop = True
+        self._sock.close()
+
+
+class _RaisingSSLContext:
+    """Fake SSL context whose wrap_socket always fails after connect."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def wrap_socket(self, sock, **kwargs):  # noqa: ANN001, ANN003
+        import ssl
+
+        self.calls += 1
+        raise ssl.SSLError("handshake boom")
+
+
+class TestCertFingerprint:
+    def test_normalize_strips_colons_and_case(self) -> None:
+        assert _normalize_fingerprint("AB:CD:ef") == "abcdef"
+        assert _normalize_fingerprint("  ab cd  ") == "abcd"
+
+    def test_verify_matches(self) -> None:
+        import hashlib
+
+        der = b"fake-cert-bytes"
+        expected = hashlib.sha256(der).hexdigest()
+        sock = MagicMock()
+        sock.getpeercert.return_value = der
+        _verify_cert_fingerprint(sock, expected)  # should not raise
+        # Colon-formatted, uppercase fingerprint also accepted
+        colonized = ":".join(
+            expected[i : i + 2] for i in range(0, len(expected), 2)
+        ).upper()
+        _verify_cert_fingerprint(sock, colonized)
+
+    def test_verify_mismatch_raises(self) -> None:
+        import ssl as _ssl
+
+        sock = MagicMock()
+        sock.getpeercert.return_value = b"real-cert"
+        with pytest.raises(_ssl.SSLCertVerificationError, match="mismatch"):
+            _verify_cert_fingerprint(sock, "00" * 32)
+
+    def test_verify_no_cert_raises(self) -> None:
+        import ssl as _ssl
+
+        sock = MagicMock()
+        sock.getpeercert.return_value = b""
+        with pytest.raises(_ssl.SSLCertVerificationError, match="no certificate"):
+            _verify_cert_fingerprint(sock, "ab" * 32)
+
+
+class TestTLSFailureClosesSocket:
+    def test_non_persistent_tls_failure_does_not_leak(self) -> None:
+        listener = _CountingListener()
+        ctx = _RaisingSSLContext()
+        client = RemoteChillerClient(
+            "127.0.0.1", listener.port, timeout=1.0, retries=1,
+            ssl_context=ctx,
+        )
+        try:
+            with pytest.raises((ConnectionError, OSError, RuntimeError)):
+                client.command("ping")
+        finally:
+            listener.close()
+        assert ctx.calls == 1  # wrap attempted, then plain socket closed
+
+    def test_persistent_tls_failure_does_not_leak(self) -> None:
+        listener = _CountingListener()
+        ctx = _RaisingSSLContext()
+        client = RemoteChillerClient(
+            "127.0.0.1", listener.port, timeout=1.0, retries=1,
+            ssl_context=ctx, persistent=True,
+        )
+        try:
+            with pytest.raises((ConnectionError, OSError, RuntimeError)):
+                client.command("ping")
+        finally:
+            client.close()
+            listener.close()
+        assert ctx.calls >= 1
 
 
 class TestTypeChecks:

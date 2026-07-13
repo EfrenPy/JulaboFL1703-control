@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import logging
 import socket
@@ -24,6 +26,27 @@ LOGGER = logging.getLogger(__name__)
 CLIENT_PROTOCOL_VERSION = 2
 
 
+def _normalize_fingerprint(value: str) -> str:
+    """Normalize a certificate fingerprint (strip colons/spaces, lowercase)."""
+    return value.replace(":", "").replace(" ", "").strip().lower()
+
+
+def _verify_cert_fingerprint(sock: ssl.SSLSocket, expected: str) -> None:
+    """Verify the peer certificate's SHA-256 fingerprint (certificate pinning).
+
+    Raises :class:`ssl.SSLCertVerificationError` on mismatch.  Used instead of
+    CA-chain validation to authenticate self-signed servers without a MITM hole.
+    """
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        raise ssl.SSLCertVerificationError("Server presented no certificate to pin")
+    actual = hashlib.sha256(der).hexdigest()
+    if not hmac.compare_digest(actual, _normalize_fingerprint(expected)):
+        raise ssl.SSLCertVerificationError(
+            f"Certificate fingerprint mismatch (expected {expected}, got {actual})"
+        )
+
+
 class _PersistentConnection:
     """Thread-safe persistent TCP connection with auto-reconnect."""
 
@@ -33,11 +56,13 @@ class _PersistentConnection:
         port: int,
         timeout: float,
         ssl_context: ssl.SSLContext | None,
+        cert_fingerprint: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._timeout = timeout
         self._ssl_context = ssl_context
+        self._cert_fingerprint = cert_fingerprint
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
         self._file: Any = None
@@ -45,7 +70,15 @@ class _PersistentConnection:
     def _connect(self) -> None:
         raw = socket.create_connection((self._host, self._port), timeout=self._timeout)
         if self._ssl_context is not None:
-            raw = self._ssl_context.wrap_socket(raw, server_hostname=self._host)
+            try:
+                raw = self._ssl_context.wrap_socket(raw, server_hostname=self._host)
+                if self._cert_fingerprint:
+                    _verify_cert_fingerprint(raw, self._cert_fingerprint)
+            except Exception:
+                # wrap_socket / pin-verify failure (bad cert, MITM, handshake
+                # timeout) must not leak the underlying socket.
+                raw.close()
+                raise
         self._sock = raw
         self._file = raw.makefile("rb")
 
@@ -94,6 +127,7 @@ class RemoteChillerClient:
         auth_token: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
         persistent: bool = False,
+        cert_fingerprint: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -101,9 +135,12 @@ class RemoteChillerClient:
         self.retries = retries
         self.auth_token = auth_token
         self._ssl_context = ssl_context
+        self._cert_fingerprint = cert_fingerprint
         self._persistent: _PersistentConnection | None = None
         if persistent:
-            self._persistent = _PersistentConnection(host, port, timeout, ssl_context)
+            self._persistent = _PersistentConnection(
+                host, port, timeout, ssl_context, cert_fingerprint=cert_fingerprint
+            )
 
     def close(self) -> None:
         """Close the persistent connection if one exists."""
@@ -131,7 +168,17 @@ class RemoteChillerClient:
                 )
                 sock: socket.socket = raw_sock
                 if self._ssl_context is not None:
-                    sock = self._ssl_context.wrap_socket(sock, server_hostname=self.host)
+                    try:
+                        sock = self._ssl_context.wrap_socket(
+                            sock, server_hostname=self.host
+                        )
+                        if self._cert_fingerprint:
+                            _verify_cert_fingerprint(sock, self._cert_fingerprint)
+                    except Exception:
+                        # Don't leak the plain socket if the TLS wrap or pin
+                        # verification fails.
+                        raw_sock.close()
+                        raise
                 with sock:
                     sock.sendall(data)
                     file = sock.makefile("rb")
@@ -519,6 +566,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to CA certificate file for TLS verification",
     )
     parser.add_argument(
+        "--tls-fingerprint",
+        default=None,
+        help=(
+            "Pin the server's certificate by its SHA-256 fingerprint (hex, "
+            "colons optional). Authenticates self-signed servers without a CA."
+        ),
+    )
+    parser.add_argument(
         "--temperature-log",
         default=None,
         help="Path to a CSV file for automatic temperature logging",
@@ -569,16 +624,26 @@ def main() -> None:  # pragma: no cover - CLI helper
 
     use_tls = args.tls or remote_cfg.get("tls", "").lower() in ("1", "true", "yes")
     tls_ca = args.tls_ca or remote_cfg.get("tls_ca")
+    tls_fingerprint = args.tls_fingerprint or remote_cfg.get("tls_fingerprint")
     ssl_ctx: ssl.SSLContext | None = None
     if use_tls:
         ssl_ctx = ssl.create_default_context(cafile=tls_ca)
         if not tls_ca:
-            # If no CA specified, don't verify (self-signed certs)
+            # No CA chain: skip CA validation. If a fingerprint is supplied we
+            # pin the certificate instead (MITM-safe); otherwise the connection
+            # is encrypted but unauthenticated — warn the operator.
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
+            if not tls_fingerprint:
+                LOGGER.warning(
+                    "TLS enabled without --tls-ca or --tls-fingerprint: the "
+                    "connection is encrypted but NOT authenticated and can be "
+                    "intercepted. Provide a CA or a pinned fingerprint."
+                )
 
     client = RemoteChillerClient(
-        host, port, timeout=timeout, auth_token=auth_token, ssl_context=ssl_ctx
+        host, port, timeout=timeout, auth_token=auth_token, ssl_context=ssl_ctx,
+        cert_fingerprint=tls_fingerprint,
     )
 
     temp_log = args.temperature_log or remote_cfg.get("temperature_log")

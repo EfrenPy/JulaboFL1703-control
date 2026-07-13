@@ -14,15 +14,15 @@ def _escape_applescript(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _escape_xml(text: str) -> str:
-    """Escape a string for safe inclusion in XML content."""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("'", "&apos;")
-        .replace('"', "&quot;")
-    )
+def _escape_powershell_single_quoted(text: str) -> str:
+    """Escape a string for a PowerShell single-quoted literal.
+
+    The value is passed to ``CreateTextNode`` (which sets XML *text content*,
+    not markup, so no XML entity escaping is needed or wanted — that would make
+    special characters display as literal entity codes).  In a single-quoted
+    PowerShell string only the quote itself is special; double it to escape.
+    """
+    return text.replace("'", "''")
 
 
 def send_desktop_notification(title: str, message: str) -> bool:
@@ -56,8 +56,8 @@ def send_desktop_notification(title: str, message: str) -> bool:
             return True
 
         if sys.platform == "win32":
-            safe_title = _escape_xml(title)
-            safe_message = _escape_xml(message)
+            safe_title = _escape_powershell_single_quoted(title)
+            safe_message = _escape_powershell_single_quoted(message)
             ps_script = (
                 "[Windows.UI.Notifications.ToastNotificationManager, "
                 "Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -165,6 +165,20 @@ class TestScheduleRunner:
         schedule = SetpointSchedule(steps=[ScheduleStep(0.0, 10.0)])
         runner = ScheduleRunner(schedule, MagicMock())
         assert runner.elapsed_minutes == 0.0
+
+    def test_uses_monotonic_clock(self) -> None:
+        # Ramp timing must not depend on the wall clock (NTP/DST jumps).
+        import julabo_control.schedule as sched_mod
+
+        schedule = SetpointSchedule(
+            steps=[ScheduleStep(0.0, 10.0), ScheduleStep(10.0, 20.0)]
+        )
+        runner = ScheduleRunner(schedule, MagicMock())
+        with patch.object(sched_mod.time, "monotonic", return_value=1000.0), \
+             patch.object(sched_mod.time, "time", side_effect=AssertionError("wall clock used")):
+            runner.start()
+            # A wall-clock jump would raise via the patched time.time; monotonic used.
+            assert runner.elapsed_minutes == 0.0
 
 
 class TestFromCsvString:

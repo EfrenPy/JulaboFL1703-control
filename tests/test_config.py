@@ -91,7 +91,7 @@ class TestConfigValidation:
         with caplog.at_level(logging.WARNING, logger="julabo_control.config"):
             result = load_config(cfg)
         assert result == {}
-        assert "Failed to parse" in caplog.text
+        assert "Failed to read config file" in caplog.text
 
     def test_known_keys_no_warning(self, tmp_path: Path, caplog) -> None:
         cfg = tmp_path / "config.ini"

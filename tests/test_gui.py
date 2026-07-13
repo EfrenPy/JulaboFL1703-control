@@ -49,6 +49,8 @@ def app(mock_chiller: MagicMock) -> ChillerApp:
         obj._reconnect_delay_factor = 2.0
         obj._closed = False
         obj._schedule_runner = None
+        obj._desktop_notifications = False
+        obj._comms_lost = False
         obj.temperature_logger = None
 
         obj.port_var = MagicMock(spec=tk.StringVar)
@@ -107,6 +109,34 @@ class TestRefreshReadings:
         app._chiller = None
         app.refresh_readings()
         app.status_var.set.assert_called_with("Not connected to Julabo chiller.")
+
+    def test_read_error_signals_comms_lost(
+        self, app: ChillerApp, mock_chiller: MagicMock
+    ) -> None:
+        mock_chiller.get_setpoint.side_effect = TimeoutError("comm error")
+        with patch("julabo_control.gui.JulaboChiller") as MockChiller:
+            MockChiller.return_value.connect.side_effect = OSError("still broken")
+            app.refresh_readings()
+        assert app._comms_lost is True
+        # A distinct comms-lost event is written to the alarm audit log.
+        events = [c.args[0] for c in app.alarm._log_event.call_args_list]
+        assert "COMMS_LOST" in events
+
+    def test_comms_lost_signaled_only_once(
+        self, app: ChillerApp, mock_chiller: MagicMock
+    ) -> None:
+        app._comms_lost = True  # already signaled
+        app._signal_comms_lost(TimeoutError("again"))
+        app.alarm._log_event.assert_not_called()
+
+    def test_recovery_clears_comms_lost(
+        self, app: ChillerApp, mock_chiller: MagicMock
+    ) -> None:
+        app._comms_lost = True
+        app.refresh_readings()  # successful read
+        assert app._comms_lost is False
+        events = [c.args[0] for c in app.alarm._log_event.call_args_list]
+        assert "COMMS_RESTORED" in events
 
 
 class TestApplySetpoint:
@@ -279,16 +309,18 @@ class TestTestConnection:
         app.port_var.get.return_value = "/dev/ttyUSB0"
         with patch("julabo_control.gui.JulaboChiller") as MockChiller, \
              patch("julabo_control.gui.remember_port"):
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__ = MagicMock(return_value=mock_ctx)
-            mock_ctx.__exit__ = MagicMock(return_value=False)
+            # The connection is opened once and kept (no close/reopen), so a
+            # single JulaboChiller instance is created and reused.
             mock_conn = MagicMock()
             mock_conn.get_setpoint.return_value = 20.0
             mock_conn.get_temperature.return_value = 21.0
             mock_conn.is_running.return_value = False
-            MockChiller.side_effect = [mock_ctx, mock_conn]
+            MockChiller.return_value = mock_conn
             app.test_connection()
+            MockChiller.assert_called_once()
             mock_conn.connect.assert_called_once()
+            mock_conn.identify.assert_called_once()
+            assert app._chiller is mock_conn
 
 
 class TestLoadScheduleSuccess:

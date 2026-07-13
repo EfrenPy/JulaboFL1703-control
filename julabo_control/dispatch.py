@@ -34,6 +34,11 @@ def dispatch_command(
     set_setpoint, temperature, is_running, start, stop, set_running,
     status_all, and ping.
 
+    This function performs no locking of its own: the shared ``ChillerBackend``
+    talks to a single serial line, so callers MUST serialize concurrent
+    invocations themselves (the sync server holds a ``threading.Lock`` and the
+    async server an ``asyncio.Lock`` around this call).
+
     Raises :class:`ValueError` for unknown commands or missing parameters.
     """
     if command == "identify":

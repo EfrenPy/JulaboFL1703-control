@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.9.0
+
+### Security
+
+- **Web dashboard authentication:** `julabo-web` now supports `--web-auth-token`,
+  enforced on every `/api/*` route and the WebSocket handshake (via the
+  `X-Auth-Token` header or `?token=` query param). The dashboard now binds to
+  `127.0.0.1` by default and warns loudly if bound off-localhost without a token.
+- **Constant-time auth checks:** TCP, async, and web auth tokens are now compared
+  with `hmac.compare_digest` (and reject non-string tokens) to close a timing
+  side-channel.
+- **TLS handshake DoS hardening:** the sync TCP server bounds the TLS handshake
+  with a timeout (previously a stalled handshake in the accept loop could block
+  all new connections); failed handshakes no longer leak the socket.
+- **Threaded web server:** the dashboard uses a threaded HTTP server so a
+  long-lived SSE stream can no longer block all other connections.
+- **Rate-limit & framing:** oversized messages are counted against the rate
+  limiter and the stream is resynced instead of desyncing the protocol; the
+  async server now enforces the full 1 MB message limit (was silently 64 KB).
+- **Request validation:** non-object JSON payloads are rejected cleanly instead
+  of crashing the connection handler; the web API caps request body size.
+- **Metrics endpoint** binds to `127.0.0.1` by default (`--metrics-host` to
+  override).
+- **Config secrets:** a warning is emitted when a config file containing secrets
+  is group/world-readable.
+- **Certificate pinning:** the remote client accepts `--tls-fingerprint` to pin a
+  self-signed server's SHA-256 certificate (MITM-safe), and now warns when TLS is
+  used with neither a CA nor a pinned fingerprint (encrypted but unauthenticated).
+- **MQTT over TLS:** the MQTT bridge supports `--mqtt-tls` / `--mqtt-tls-ca` /
+  `--mqtt-tls-insecure`, enabling TLS before credentials are sent, and warns when
+  a username/password is configured without TLS.
+- **Subresource Integrity:** the dashboard loads Chart.js with a pinned version
+  and an `integrity` (SRI) hash plus `crossorigin`, so a compromised CDN cannot
+  inject script.
+
+### Bug Fixes
+
+- **Safe device-response parsing:** malformed/garbled serial responses now raise
+  `JulaboError` instead of a bare `ValueError`, and truncated frames without a
+  line terminator are treated as timeouts rather than accepted as valid data.
+- **CLI error handling:** out-of-range setpoints and unparseable readings surface
+  as clean errors instead of raw tracebacks; the raw `send` command refuses
+  bounds-bypassing setpoint/mode commands unless `--force` is given.
+- **Schedule ramp timing** uses a monotonic clock, so an NTP/DST/manual clock
+  change can no longer jump the ramp to its final setpoint; `ScheduleRunner` is
+  now internally locked.
+- **Alarm robustness:** temperature alarms have a hysteresis deadband (no more
+  chatter around the threshold) and dispatch desktop/Alertmanager notifications
+  off the caller's thread (the Tk UI no longer freezes on slow endpoints);
+  alarm-log write failures are logged rather than silently swallowed.
+- **Comms-loss alarm:** the local GUI now raises a distinct alarm (bell +
+  notification + audit entry) when it loses contact with the chiller.
+- **Isolated GUI shutdown:** each window-close cleanup step is guarded so one
+  failure can no longer leak the serial port or freeze the window.
+- **Client socket leak:** the remote client no longer leaks a socket when the TLS
+  handshake fails.
+- **Robust config loading:** unreadable/permission-denied config files degrade to
+  defaults; CLI config values use the range-checked `get_int`/`get_float`
+  helpers.
+- **Temperature history wired up:** `julabo-web --db-path` now records readings to
+  SQLite (previously the store was never populated); `TemperatureDB` gains
+  `purge_older_than()` for retention.
+- **Safer port auto-detection:** the blind port scan (which writes a probe to
+  every candidate port) only runs when the OS enumerates no serial ports,
+  avoiding pokes at unrelated instruments.
+
 ## v0.8.0
 
 ### Architecture

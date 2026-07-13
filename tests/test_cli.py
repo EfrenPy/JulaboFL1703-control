@@ -42,6 +42,25 @@ class TestCLI:
         assert result == 0
         _mock_chiller.raw_command.assert_called_once_with("in_sp_00")
 
+    def test_send_unsafe_setpoint_blocked(self, _mock_chiller) -> None:
+        # Raw setpoint command bypasses safety bounds → blocked without --force.
+        with pytest.raises(SystemExit):
+            main(["send", "out_sp_00 999"])
+        _mock_chiller.raw_command.assert_not_called()
+
+    def test_send_unsafe_setpoint_forced(self, _mock_chiller) -> None:
+        _mock_chiller.raw_command.return_value = "OK"
+        result = main(["send", "out_sp_00 30.0", "--force"])
+        assert result == 0
+        _mock_chiller.raw_command.assert_called_once_with("out_sp_00 30.0")
+
+    def test_set_setpoint_out_of_range_clean_error(self, _mock_chiller) -> None:
+        # ValueError from bounds validation must be a clean parser error,
+        # not an unhandled traceback.
+        _mock_chiller.set_setpoint.side_effect = ValueError("outside the allowed range")
+        with pytest.raises(SystemExit):
+            main(["set-setpoint", "300"])
+
     def test_missing_command_exits(self) -> None:
         with pytest.raises(SystemExit):
             main([])

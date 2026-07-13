@@ -117,7 +117,12 @@ class JulaboChiller:
 
     def _write(self, message: str) -> None:
         self._enforce_rate_limit()
-        data = (message + "\r\n").encode("ascii")
+        try:
+            data = (message + "\r\n").encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise JulaboError(
+                f"Command contains non-ASCII characters: {message!r}"
+            ) from exc
         LOGGER.debug("TX: %s", message)
         self.serial.write(data)
 
@@ -125,9 +130,27 @@ class JulaboChiller:
         raw = self.serial.readline()
         if not raw:
             raise TimeoutError("No response from Julabo chiller (timeout).")
+        # ``Serial.readline`` returns whatever partial bytes arrived when the
+        # read timeout expires, even without a trailing terminator.  Treat a
+        # frame with no line terminator as a timeout rather than silently
+        # accepting a truncated (and possibly still-parseable) value.
+        if not raw.endswith((b"\n", b"\r")):
+            raise TimeoutError(
+                f"Incomplete response from Julabo chiller (no line terminator): {raw!r}"
+            )
         decoded = str(raw.decode("ascii", errors="replace").strip())
         LOGGER.debug("RX: %s", decoded)
         return decoded
+
+    @staticmethod
+    def _parse_float(response: str, what: str) -> float:
+        """Parse a numeric device response, wrapping failures as JulaboError."""
+        try:
+            return float(response)
+        except (TypeError, ValueError) as exc:
+            raise JulaboError(
+                f"Unparseable {what} response from Julabo chiller: {response!r}"
+            ) from exc
 
     def _query(self, command: str) -> str:
         self._write(command)
@@ -151,7 +174,7 @@ class JulaboChiller:
         """Return the active temperature setpoint in °C."""
 
         response = self._query("in_sp_00")
-        return float(response)
+        return self._parse_float(response, "setpoint")
 
     def set_setpoint(self, value: float) -> None:
         """Update the temperature setpoint."""
@@ -161,6 +184,16 @@ class JulaboChiller:
                 f"Setpoint {value} °C is outside the allowed range "
                 f"[{SETPOINT_MIN}, {SETPOINT_MAX}]."
             )
+        # The device protocol only accepts one decimal place; round to the
+        # transmitted precision so the read-back tolerance check compares like
+        # for like and callers are informed when their request was altered.
+        transmitted = round(value, 1)
+        if transmitted != value:
+            LOGGER.info(
+                "Setpoint %.4f °C rounded to device resolution %.1f °C",
+                value, transmitted,
+            )
+        value = transmitted
         self._write(f"out_sp_00 {value:.1f}")
         for attempt in range(3):
             time.sleep(0.05)
@@ -187,23 +220,39 @@ class JulaboChiller:
         """Return the current process temperature in °C."""
 
         response = self._query("in_pv_00")
-        return float(response)
+        return self._parse_float(response, "temperature")
 
     def set_running(self, start: bool) -> bool:
         """Start or stop the circulation pump and confirm the new state."""
 
         value = 1 if start else 0
         self._write(f"out_mode_05 {value}")
-        confirmed = self.is_running()
-        if confirmed != start:
-            raise JulaboError(
-                "Julabo chiller did not acknowledge the requested cooling state. "
-                "Expected {} but read back {}.".format(
-                    "running" if start else "stopped",
-                    "running" if confirmed else "stopped",
+        # The mode register can briefly lag the accepted command; retry the
+        # confirmation read a few times before declaring a mismatch, mirroring
+        # the tolerance loop used by ``set_setpoint``.
+        confirmed = start
+        for attempt in range(3):
+            time.sleep(0.05)
+            try:
+                confirmed = self.is_running()
+            except (TimeoutError, JulaboError) as exc:
+                LOGGER.debug(
+                    "Running-state verify attempt %d failed: %s", attempt + 1, exc
                 )
+                if attempt == 2:
+                    raise JulaboError(
+                        "Running state unknown after 3 verification attempts."
+                    ) from exc
+                continue
+            if confirmed == start:
+                return confirmed
+        raise JulaboError(
+            "Julabo chiller did not acknowledge the requested cooling state. "
+            "Expected {} but read back {}.".format(
+                "running" if start else "stopped",
+                "running" if confirmed else "stopped",
             )
-        return confirmed
+        )
 
     def is_running(self) -> bool:
         """Return ``True`` if the circulation pump is running."""
@@ -282,10 +331,21 @@ def candidate_ports() -> Iterator[str]:
             seen.add(port_info.device)
             yield port_info.device
 
-    # Provide manual fallbacks for systems where ``list_ports`` returns an empty
-    # list.  The logic is kept inline to avoid importing ``sys`` or ``glob`` at
-    # module import time for environments that do not require them.
+    # Only fall back to a blind enumeration when ``list_ports`` reported no
+    # devices.  Probing writes ``version`` to every candidate port, so scanning
+    # ports the OS did not enumerate risks poking unrelated instruments sharing
+    # the bus — restrict the blind scan to the "nothing enumerated" case.
+    if seen:
+        return
+
+    # The logic is kept inline to avoid importing ``sys`` or ``glob`` at module
+    # import time for environments that do not require them.
     import sys
+
+    LOGGER.warning(
+        "No serial ports enumerated by the OS; falling back to a blind scan "
+        "that writes a probe command to every candidate port."
+    )
 
     if sys.platform.startswith("win"):
         for index in range(1, 257):

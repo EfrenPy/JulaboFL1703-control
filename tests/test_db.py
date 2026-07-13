@@ -19,6 +19,25 @@ class TestTemperatureDB:
         assert rows[0]["is_running"] == 1
         db.close()
 
+    def test_purge_older_than(self) -> None:
+        db = TemperatureDB(":memory:")
+        with db._lock:
+            old_ts = time.time() - 10 * 86400  # 10 days ago
+            db._conn.execute(
+                "INSERT INTO temperature_readings "
+                "(timestamp, chiller_id, temperature, setpoint, is_running) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (old_ts, "default", 18.0, 20.0, 0),
+            )
+            db._conn.commit()
+        db.record(21.5, 20.0)  # recent
+        removed = db.purge_older_than(7)
+        assert removed == 1
+        rows = db.query_recent(60 * 24 * 365)  # a year window
+        assert len(rows) == 1
+        assert rows[0]["temperature"] == 21.5
+        db.close()
+
     def test_query_filters_by_time(self) -> None:
         db = TemperatureDB(":memory:")
         # Insert a reading "in the past"

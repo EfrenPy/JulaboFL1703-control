@@ -93,16 +93,34 @@ class TestJulaboChiller:
         self, chiller: JulaboChiller, mock_serial: MockSerial
     ) -> None:
         mock_serial.queue("1")  # is_running confirmation
-        result = chiller.set_running(True)
+        with patch("julabo_control.core.time.sleep"):
+            result = chiller.set_running(True)
         assert result is True
         assert b"out_mode_05 1" in mock_serial.written[0]
+
+    def test_set_running_retries_then_succeeds(
+        self, chiller: JulaboChiller, mock_serial: MockSerial
+    ) -> None:
+        # First confirmation lags (still stopped), second reports running.
+        mock_serial.queue("0", "1")
+        with patch("julabo_control.core.time.sleep"):
+            assert chiller.set_running(True) is True
 
     def test_set_running_mismatch(
         self, chiller: JulaboChiller, mock_serial: MockSerial
     ) -> None:
-        mock_serial.queue("0")  # confirmation doesn't match
-        with pytest.raises(JulaboError, match="did not acknowledge"):
-            chiller.set_running(True)
+        mock_serial.queue("0", "0", "0")  # never acknowledges across all retries
+        with patch("julabo_control.core.time.sleep"):
+            with pytest.raises(JulaboError, match="did not acknowledge"):
+                chiller.set_running(True)
+
+    def test_set_running_state_unknown_on_timeout(
+        self, chiller: JulaboChiller, mock_serial: MockSerial
+    ) -> None:
+        # No confirmations queued → all reads time out.
+        with patch("julabo_control.core.time.sleep"):
+            with pytest.raises(JulaboError, match="state unknown"):
+                chiller.set_running(True)
 
     def test_is_running_true(
         self, chiller: JulaboChiller, mock_serial: MockSerial
@@ -129,6 +147,34 @@ class TestJulaboChiller:
         # No responses queued → empty readline → TimeoutError
         with pytest.raises(TimeoutError):
             chiller.identify()
+
+    def test_unparseable_setpoint_raises_julabo_error(
+        self, chiller: JulaboChiller, mock_serial: MockSerial
+    ) -> None:
+        mock_serial.queue("garbled")
+        with pytest.raises(JulaboError, match="Unparseable setpoint"):
+            chiller.get_setpoint()
+
+    def test_unparseable_temperature_raises_julabo_error(
+        self, chiller: JulaboChiller, mock_serial: MockSerial
+    ) -> None:
+        mock_serial.queue("no-number")
+        with pytest.raises(JulaboError, match="Unparseable temperature"):
+            chiller.get_temperature()
+
+    def test_incomplete_frame_raises_timeout(
+        self, chiller: JulaboChiller, mock_serial: MockSerial
+    ) -> None:
+        # A partial frame with no line terminator must not be accepted.
+        mock_serial.readline = lambda: b"25."  # type: ignore[assignment]
+        with pytest.raises(TimeoutError, match="Incomplete response"):
+            chiller.get_temperature()
+
+    def test_non_ascii_command_raises_julabo_error(
+        self, chiller: JulaboChiller, mock_serial: MockSerial
+    ) -> None:
+        with pytest.raises(JulaboError, match="non-ASCII"):
+            chiller.raw_command("temperatüre")
 
     def test_serial_property_not_connected(self) -> None:
         settings = SerialSettings(port="/dev/null")

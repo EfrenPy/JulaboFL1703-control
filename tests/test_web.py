@@ -36,6 +36,142 @@ def _url(server, path: str) -> str:
     return f"http://127.0.0.1:{port}{path}"
 
 
+@pytest.fixture
+def auth_web_server():
+    """Start a JulaboWebServer that requires a web auth token."""
+    client = MagicMock()
+    client.status_all.return_value = {
+        "status": "01 OK", "temperature": 21.5, "setpoint": 20.0, "is_running": True,
+    }
+    server = JulaboWebServer(("127.0.0.1", 0), client, web_auth_token="s3cret")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield server, client
+    server.shutdown()
+    thread.join(timeout=5)
+
+
+class TestWebAuth:
+    def test_api_status_without_token_is_401(self, auth_web_server) -> None:
+        server, client = auth_web_server
+        try:
+            urllib.request.urlopen(_url(server, "/api/status"), timeout=5)
+            raise AssertionError("Should have raised 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401
+        client.status_all.assert_not_called()
+
+    def test_api_status_with_header_token(self, auth_web_server) -> None:
+        server, _ = auth_web_server
+        req = urllib.request.Request(
+            _url(server, "/api/status"), headers={"X-Auth-Token": "s3cret"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        assert data["temperature"] == 21.5
+
+    def test_api_status_with_query_token(self, auth_web_server) -> None:
+        server, _ = auth_web_server
+        with urllib.request.urlopen(
+            _url(server, "/api/status?token=s3cret"), timeout=5
+        ) as resp:
+            assert resp.status == 200
+
+    def test_wrong_token_rejected(self, auth_web_server) -> None:
+        server, _ = auth_web_server
+        req = urllib.request.Request(
+            _url(server, "/api/status"), headers={"X-Auth-Token": "wrong"}
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("Should have raised 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401
+
+    def test_setpoint_post_requires_token(self, auth_web_server) -> None:
+        server, client = auth_web_server
+        req = urllib.request.Request(
+            _url(server, "/api/setpoint"), data=b'{"value": 25}', method="POST"
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("Should have raised 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401
+        client.command.assert_not_called()
+
+    def test_root_and_health_are_public(self, auth_web_server) -> None:
+        server, _ = auth_web_server
+        with urllib.request.urlopen(_url(server, "/"), timeout=5) as resp:
+            assert resp.status == 200
+        with urllib.request.urlopen(_url(server, "/api/health"), timeout=5) as resp:
+            assert resp.status == 200
+
+
+class TestBodyLimit:
+    def test_oversized_body_rejected(self, web_server) -> None:
+        server, client = web_server
+        port = server.server_address[1]
+        # Advertise an over-limit Content-Length via a raw request; the server
+        # rejects with 413 before reading the (unsent) body.
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            request = (
+                "POST /api/setpoint HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {300 * 1024}\r\n"
+                "\r\n"
+            )
+            sock.sendall(request.encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+        finally:
+            sock.close()
+        assert b"413" in resp.split(b"\r\n", 1)[0]
+        client.command.assert_not_called()
+
+
+class TestHistoryRecorder:
+    def test_records_to_db(self) -> None:
+        from julabo_control.db import TemperatureDB
+        from julabo_control.web import _HistoryRecorder
+
+        client = MagicMock()
+        client.status_all.return_value = {"temperature": 21.0, "setpoint": 20.0}
+        db = TemperatureDB(":memory:")
+        recorder = _HistoryRecorder(client, db, interval=0.05)
+        recorder.start()
+        deadline = 3.0
+        while not db.query_recent(60) and deadline > 0:
+            import time as _t
+
+            _t.sleep(0.05)
+            deadline -= 0.05
+        recorder.stop()
+        rows = db.query_recent(60)
+        assert rows and rows[0]["temperature"] == 21.0
+        db.close()
+
+    def test_record_failure_is_swallowed(self) -> None:
+        from julabo_control.web import _HistoryRecorder
+
+        client = MagicMock()
+        client.status_all.side_effect = RuntimeError("down")
+        db = MagicMock()
+        recorder = _HistoryRecorder(client, db, interval=0.05)
+        recorder.start()
+        import time as _t
+
+        _t.sleep(0.15)
+        recorder.stop()  # must not raise despite client errors
+        db.record.assert_not_called()
+
+
 class TestWebServer:
     def test_html_served_at_root(self, web_server) -> None:
         server, _ = web_server

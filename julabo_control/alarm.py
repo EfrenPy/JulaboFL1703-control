@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import threading
 import urllib.request
 from datetime import datetime, timezone
 from typing import IO, Any, Callable
@@ -90,6 +91,8 @@ class TemperatureAlarm:
         desktop_notifications: bool = False,
         log_file: str | None = None,
         alertmanager_client: AlertmanagerClient | None = None,
+        hysteresis: float | None = None,
+        async_notifications: bool = False,
     ):
         self.threshold = threshold
         self._on_alarm = on_alarm
@@ -100,10 +103,31 @@ class TemperatureAlarm:
         self._log_fh: IO[str] | None = None
         self._log_writer: Any = None
         self._alertmanager = alertmanager_client
+        # Deadband to prevent alarm chatter when the temperature hovers around
+        # the threshold: alarm engages above ``threshold`` and only clears once
+        # the deviation falls back below ``threshold - hysteresis``.  Defaults
+        # to 10% of the threshold.
+        self._hysteresis = hysteresis
+        # When enabled, blocking notification I/O (desktop toast subprocess and
+        # Alertmanager HTTP POST) runs in a daemon thread so a slow/unreachable
+        # endpoint never freezes the caller (e.g. the Tk event loop).
+        self._async_notifications = async_notifications
 
     @property
     def is_alarming(self) -> bool:
         return self._alarming
+
+    @property
+    def _clear_threshold(self) -> float:
+        band = self._hysteresis if self._hysteresis is not None else abs(self.threshold) * 0.1
+        return self.threshold - band
+
+    def _dispatch(self, func: Callable[[], None]) -> None:
+        """Run a (possibly blocking) notification callable sync or off-thread."""
+        if self._async_notifications:
+            threading.Thread(target=func, daemon=True).start()
+        else:
+            func()
 
     def _ensure_log_open(self) -> Any | None:
         """Open the log file if needed and return the CSV writer."""
@@ -140,8 +164,10 @@ class TemperatureAlarm:
             ])
             if self._log_fh is not None:
                 self._log_fh.flush()
-        except OSError:
-            pass
+        except OSError as exc:
+            # Never raise from the alarm path, but do not silently drop the
+            # audit-trail failure either — surface it so a gap is detectable.
+            LOGGER.warning("Alarm log write failed (%s): %s", self._log_file_path, exc)
 
     def close(self) -> None:
         """Close the alarm log file handle."""
@@ -165,9 +191,9 @@ class TemperatureAlarm:
             return False
 
         deviation = abs(temperature - setpoint)
-        alarming = deviation > self.threshold
-
-        if alarming and not self._alarming:
+        # Hysteresis: engage above ``threshold``, clear only once the deviation
+        # falls back below ``threshold - hysteresis``.  In between, hold state.
+        if not self._alarming and deviation > self.threshold:
             self._alarming = True
             LOGGER.warning(
                 "Temperature alarm: %.2f °C deviates from setpoint %.2f °C by %.2f °C "
@@ -179,29 +205,46 @@ class TemperatureAlarm:
             )
             self._log_event("ALARM", temperature, setpoint)
             if self._desktop_notifications:
-                from .notifications import send_desktop_notification
+                dev = deviation
+                temp = temperature
+                sp = setpoint
 
-                send_desktop_notification(
-                    "Julabo Temperature Alarm",
-                    f"Temperature {temperature:.1f} °C deviates from "
-                    f"setpoint {setpoint:.1f} °C by {deviation:.1f} °C",
-                )
+                def _notify() -> None:
+                    from .notifications import send_desktop_notification
+
+                    send_desktop_notification(
+                        "Julabo Temperature Alarm",
+                        f"Temperature {temp:.1f} °C deviates from "
+                        f"setpoint {sp:.1f} °C by {dev:.1f} °C",
+                    )
+
+                self._dispatch(_notify)
             if self._alertmanager is not None:
-                try:
-                    self._alertmanager.send_firing(temperature, setpoint, self.threshold)
-                except Exception:
-                    LOGGER.warning("Alertmanager send_firing failed", exc_info=True)
+                am = self._alertmanager
+
+                def _fire() -> None:
+                    try:
+                        am.send_firing(temperature, setpoint, self.threshold)
+                    except Exception:
+                        LOGGER.warning("Alertmanager send_firing failed", exc_info=True)
+
+                self._dispatch(_fire)
             if self._on_alarm is not None:
                 self._on_alarm()
-        elif not alarming and self._alarming:
+        elif self._alarming and deviation <= self._clear_threshold:
             self._alarming = False
             LOGGER.info("Temperature alarm cleared")
             self._log_event("CLEAR", temperature, setpoint)
             if self._alertmanager is not None:
-                try:
-                    self._alertmanager.send_resolved(temperature, setpoint)
-                except Exception:
-                    LOGGER.warning("Alertmanager send_resolved failed", exc_info=True)
+                am = self._alertmanager
+
+                def _resolve() -> None:
+                    try:
+                        am.send_resolved(temperature, setpoint)
+                    except Exception:
+                        LOGGER.warning("Alertmanager send_resolved failed", exc_info=True)
+
+                self._dispatch(_resolve)
             if self._on_clear is not None:
                 self._on_clear()
 

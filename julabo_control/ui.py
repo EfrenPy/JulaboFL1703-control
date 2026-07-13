@@ -131,10 +131,14 @@ class TemperatureHistoryPlot:
         """Write recorded history to a CSV file. Returns the number of rows written."""
         if not self._history:
             return 0
+        # ``elapsed_minutes_buffer`` is relative to the oldest sample still in
+        # the ring buffer (older ones are trimmed), NOT the session start — the
+        # explicit name avoids confusion with the persistent temperature log,
+        # which measures elapsed time from the first sample of the session.
         start_time = self._history[0][0]
         with open(file_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp_utc", "elapsed_minutes", "temperature_c"])
+            writer.writerow(["timestamp_utc", "elapsed_minutes_buffer", "temperature_c"])
             for ts, temp in self._history:
                 utc_str = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
                 elapsed = (ts - start_time) / 60.0
@@ -267,7 +271,9 @@ class BaseChillerApp:
             try:
                 self.temperature_logger.record(temperature, setpoint)
             except OSError as exc:
-                LOGGER.debug("Temperature logging failed: %s", exc)
+                # Warn (not debug): a failing history log should be visible in
+                # normal production logging, not silently dropped.
+                LOGGER.warning("Temperature logging failed: %s", exc)
 
     def _update_temperature_plot(self, value: float) -> None:
         if self.temperature_plot is not None:

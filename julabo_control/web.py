@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
 from .core import SETPOINT_MAX, SETPOINT_MIN
 
 LOGGER = logging.getLogger(__name__)
+
+# Maximum accepted request body size for the JSON API (bytes).
+MAX_BODY_SIZE = 256 * 1024
+
+# Paths that never require the web auth token: the static page (which then
+# supplies the token on API calls) and the liveness probe.
+_PUBLIC_PATHS = frozenset({"/", "/api/health"})
 
 _SAFE_ERROR_TYPES = (ValueError, TypeError, KeyError)
 
@@ -31,7 +40,9 @@ _HTML_PAGE = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Julabo Control</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4"
+crossorigin="anonymous"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f5;color:#333;padding:20px}
@@ -85,6 +96,9 @@ placeholder="elapsed_minutes,temperature_c&#10;0,20&#10;10,30"></textarea>
 <div class="status-msg" id="msg"></div>
 </div>
 <script>
+const TOKEN=new URLSearchParams(location.search).get('token');
+function apiUrl(p){if(!TOKEN)return p;
+return p+(p.includes('?')?'&':'?')+'token='+encodeURIComponent(TOKEN)}
 const maxPts=120,temps=[],labels=[];
 const ctx=document.getElementById('chart').getContext('2d');
 const chart=new Chart(ctx,{type:'line',data:{labels:labels,datasets:[
@@ -103,37 +117,37 @@ temps.push(d.temperature);labels.push(temps.length);
 if(temps.length>maxPts){temps.shift();labels.shift()}
 chart.update();msg('')}
 async function refresh(){
-try{const r=await fetch('/api/status');const d=await r.json();
+try{const r=await fetch(apiUrl('/api/status'));const d=await r.json();
 updateUI(d)}catch(e){msg('Error: '+e)}
 }
 let pollId=null;
 function startPolling(){pollId=setInterval(refresh,5000)}
 function stopPolling(){if(pollId){clearInterval(pollId);pollId=null}}
-try{const es=new EventSource('/api/events');
+try{const es=new EventSource(apiUrl('/api/events'));
 es.onmessage=function(e){try{updateUI(JSON.parse(e.data))}catch(err){msg('SSE parse error')}};
 es.onerror=function(){es.close();startPolling()}}catch(e){startPolling()}
 async function applySp(){const v=document.getElementById('newSp').value;
 if(!v){msg('Enter a value');return}
-try{await fetch('/api/setpoint',{method:'POST',headers:{'Content-Type':'application/json'},
+try{await fetch(apiUrl('/api/setpoint'),{method:'POST',headers:{'Content-Type':'application/json'},
 body:JSON.stringify({value:parseFloat(v)})});
 msg('Setpoint updated');refresh()}catch(e){msg('Error: '+e)}}
-async function doStart(){try{await fetch('/api/start',
+async function doStart(){try{await fetch(apiUrl('/api/start'),
 {method:'POST'});msg('Started');refresh()
 }catch(e){msg('Error: '+e)}}
-async function doStop(){try{await fetch('/api/stop',
+async function doStop(){try{await fetch(apiUrl('/api/stop'),
 {method:'POST'});msg('Stopped');refresh()
 }catch(e){msg('Error: '+e)}}
 async function uploadSchedule(){const csv=document.getElementById('schedCsv').value;
 if(!csv){msg('Enter CSV data');return}
-try{const r=await fetch('/api/schedule',{method:'POST',
+try{const r=await fetch(apiUrl('/api/schedule'),{method:'POST',
 headers:{'Content-Type':'application/json'},
 body:JSON.stringify({csv:csv})});const d=await r.json();
 if(d.status==='ok'){msg('Schedule uploaded');refreshScheduleStatus()}
 else{msg('Error: '+(d.error||'unknown'))}}catch(e){msg('Error: '+e)}}
-async function stopSchedule(){try{await fetch('/api/schedule',
+async function stopSchedule(){try{await fetch(apiUrl('/api/schedule'),
 {method:'DELETE'});msg('Schedule stopped');
 document.getElementById('schedStatus').textContent='Stopped'}catch(e){msg('Error: '+e)}}
-async function refreshScheduleStatus(){try{const r=await fetch('/api/schedule/status');
+async function refreshScheduleStatus(){try{const r=await fetch(apiUrl('/api/schedule/status'));
 const d=await r.json();const el=document.getElementById('schedStatus');
 if(d.running){el.textContent='Running: '+d.elapsed_minutes+'/'+d.total_minutes+' min'}
 else{el.textContent='Not running'}}catch(e){}}
@@ -224,9 +238,30 @@ class JulaboWebHandler(BaseHTTPRequestHandler):
             return "/api/" + path[len("/api/v1/"):]
         return path
 
+    def _authorized(self, path: str, query: str) -> bool:
+        """Return True if the request may proceed given the web auth token.
+
+        Auth is disabled when no token is configured.  The token may be
+        supplied via the ``X-Auth-Token`` header (fetch/XHR) or a ``token``
+        query parameter (EventSource/WebSocket, which cannot set headers).
+        The static page and health probe are always public.
+        """
+        expected = self.server.web_auth_token
+        if not expected or path in _PUBLIC_PATHS:
+            return True
+        provided = self.headers.get("X-Auth-Token")
+        if provided is None and query:
+            provided = urllib.parse.parse_qs(query).get("token", [None])[0]
+        if provided is not None and hmac.compare_digest(provided, expected):
+            return True
+        self._json_response(401, {"error": "Unauthorized"})
+        return False
+
     def do_GET(self) -> None:
         path = self._normalize_path(self.path.split("?")[0])
         query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        if not self._authorized(path, query):
+            return
         if path == "/":
             self._html_response(200, _HTML_PAGE)
         elif path == "/api/status":
@@ -253,7 +288,11 @@ class JulaboWebHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:
-        path = self._normalize_path(self.path)
+        raw_path = self.path.split("?", 1)[0]
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        path = self._normalize_path(raw_path)
+        if not self._authorized(path, query):
+            return
         if path == "/api/setpoint":
             try:
                 body = self._read_json_body()
@@ -312,7 +351,11 @@ class JulaboWebHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_DELETE(self) -> None:
-        path = self._normalize_path(self.path)
+        raw_path = self.path.split("?", 1)[0]
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        path = self._normalize_path(raw_path)
+        if not self._authorized(path, query):
+            return
         if path == "/api/schedule":
             try:
                 result = self.server.client.stop_schedule()
@@ -383,7 +426,14 @@ class JulaboWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json_body(self) -> dict[str, Any] | None:
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._json_response(400, {"error": "Invalid Content-Length"})
+            return None
+        if length > MAX_BODY_SIZE:
+            self._json_response(413, {"error": "Request body too large"})
+            return None
         if length > 0:
             raw = self.rfile.read(length)
             try:
@@ -397,8 +447,13 @@ class JulaboWebHandler(BaseHTTPRequestHandler):
         LOGGER.debug(fmt, *args)
 
 
-class JulaboWebServer(HTTPServer):
-    """HTTP server that proxies to a RemoteChillerClient."""
+class JulaboWebServer(ThreadingHTTPServer):
+    """HTTP server that proxies to a RemoteChillerClient.
+
+    Threaded so a long-lived SSE stream cannot block other connections.
+    """
+
+    daemon_threads = True
 
     def __init__(
         self,
@@ -408,13 +463,16 @@ class JulaboWebServer(HTTPServer):
         sse_interval: float = 5.0,
         db: Any = None,
         ws_port: int | None = None,
+        web_auth_token: str | None = None,
     ) -> None:
         super().__init__(server_address, JulaboWebHandler)
         self.client = client
         self.sse_interval = sse_interval
         self.db = db
+        self.web_auth_token = web_auth_token
         self._ws_thread: threading.Thread | None = None
         self._ws_loop: Any = None
+        self._ws_host = server_address[0]
         if ws_port is not None:
             self._start_ws(ws_port)
 
@@ -442,6 +500,18 @@ class JulaboWebServer(HTTPServer):
         server_ref = self
 
         async def _ws_handler(ws: Any) -> None:
+            # Enforce the web auth token (supplied as a ?token= query param,
+            # since browsers cannot set headers on the WebSocket handshake).
+            expected = server_ref.web_auth_token
+            if expected:
+                path = getattr(getattr(ws, "request", None), "path", "") or getattr(
+                    ws, "path", ""
+                )
+                query = path.split("?", 1)[1] if "?" in path else ""
+                provided = urllib.parse.parse_qs(query).get("token", [None])[0]
+                if provided is None or not hmac.compare_digest(provided, expected):
+                    await ws.close(code=1008, reason="Unauthorized")
+                    return
             await ws.send(json.dumps({"type": "connected"}))
             while True:
                 try:
@@ -504,12 +574,14 @@ class JulaboWebServer(HTTPServer):
         server_self = self
         self._ws_server: Any = None
 
+        ws_host = self._ws_host or "127.0.0.1"
+
         async def _run_ws_managed() -> None:
             ws_server = await websockets.serve(  # type: ignore[attr-defined]
-                _ws_handler, "0.0.0.0", port,
+                _ws_handler, ws_host, port,
             )
             server_self._ws_server = ws_server
-            LOGGER.info("WebSocket server on ws://0.0.0.0:%d", port)
+            LOGGER.info("WebSocket server on ws://%s:%d", ws_host, port)
             await asyncio.Future()  # run forever
 
         def _thread_target() -> None:
@@ -525,6 +597,36 @@ class JulaboWebServer(HTTPServer):
 
         self._ws_thread = threading.Thread(target=_thread_target, daemon=True)
         self._ws_thread.start()
+
+
+class _HistoryRecorder:
+    """Background thread that periodically records readings into the DB.
+
+    Without this, ``TemperatureDB`` is never populated and the history view
+    always returns empty results.
+    """
+
+    def __init__(self, client: Any, db: Any, *, interval: float = 10.0) -> None:
+        self._client = client
+        self._db = db
+        self._interval = max(1.0, interval)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self._interval + 1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                data = self._client.status_all()
+                self._db.record(data["temperature"], data["setpoint"])
+            except Exception as exc:  # network/db hiccup — keep trying
+                LOGGER.debug("History record skipped: %s", exc)
 
 
 def main() -> None:  # pragma: no cover - CLI helper
@@ -543,7 +645,7 @@ def main() -> None:  # pragma: no cover - CLI helper
     )
     parser.add_argument(
         "--web-host", default=None,
-        help="Web server bind address (default: 0.0.0.0)",
+        help="Web server bind address (default: 127.0.0.1, localhost only)",
     )
     parser.add_argument(
         "--web-port", type=int, default=None,
@@ -551,7 +653,18 @@ def main() -> None:  # pragma: no cover - CLI helper
     )
     parser.add_argument(
         "--auth-token", default=None,
-        help="Auth token for the TCP server",
+        help="Auth token for the upstream TCP server",
+    )
+    parser.add_argument(
+        "--web-auth-token", default=None,
+        help=(
+            "Require this token on all dashboard API/WebSocket requests "
+            "(via X-Auth-Token header or ?token= query param)."
+        ),
+    )
+    parser.add_argument(
+        "--db-path", default=None,
+        help="SQLite path for temperature history (enables the history view)",
     )
     parser.add_argument(
         "--config", default=None,
@@ -567,12 +680,14 @@ def main() -> None:  # pragma: no cover - CLI helper
 
     host = args.host or web_cfg.get("host", "localhost")
     port = args.port if args.port is not None else int(web_cfg.get("port", "8765"))
-    web_host = args.web_host or web_cfg.get("web_host", "0.0.0.0")
+    web_host = args.web_host or web_cfg.get("web_host", "127.0.0.1")
     web_port = (
         args.web_port if args.web_port is not None
         else int(web_cfg.get("web_port", "8080"))
     )
     auth_token = args.auth_token or web_cfg.get("auth_token")
+    web_auth_token = args.web_auth_token or web_cfg.get("web_auth_token")
+    db_path = args.db_path or web_cfg.get("db_path")
 
     client = RemoteChillerClient(host, port, auth_token=auth_token)
 
@@ -580,15 +695,47 @@ def main() -> None:  # pragma: no cover - CLI helper
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    server = JulaboWebServer((web_host, web_port), client)
+
+    # Warn loudly if the dashboard is exposed beyond localhost without a token:
+    # every API route can control the physical chiller.
+    if web_host not in ("127.0.0.1", "localhost", "::1") and not web_auth_token:
+        LOGGER.warning(
+            "Web dashboard is bound to %s with NO --web-auth-token; anyone who "
+            "can reach this port can control the chiller. Set --web-auth-token "
+            "or bind to 127.0.0.1.",
+            web_host,
+        )
+
+    db = None
+    recorder: _HistoryRecorder | None = None
+    if db_path:
+        from .db import TemperatureDB
+
+        db = TemperatureDB(db_path)
+        try:
+            record_interval = float(web_cfg.get("record_interval", "10"))
+        except (TypeError, ValueError):
+            record_interval = 10.0
+        recorder = _HistoryRecorder(client, db, interval=record_interval)
+        recorder.start()
+
+    server = JulaboWebServer(
+        (web_host, web_port), client, db=db, web_auth_token=web_auth_token,
+    )
     LOGGER.info("Web UI serving on http://%s:%d", web_host, web_port)
     LOGGER.info("Proxying to TCP server at %s:%d", host, port)
+    if web_auth_token:
+        LOGGER.info("Dashboard authentication enabled")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if recorder is not None:
+            recorder.stop()
         server.server_close()
+        if db is not None:
+            db.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

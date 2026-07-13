@@ -111,6 +111,35 @@ class TestMQTTBridge:
         from julabo_control.mqtt_bridge import main
         assert callable(main)
 
+    def test_tls_enabled_calls_tls_set(self, mock_paho) -> None:
+        client = MagicMock()
+        MQTTBridge(client, "mqtt.local", tls=True, tls_ca="/ca.pem")
+        mock_paho.tls_set.assert_called_once_with(ca_certs="/ca.pem")
+
+    def test_tls_insecure_sets_flag(self, mock_paho) -> None:
+        client = MagicMock()
+        MQTTBridge(client, "mqtt.local", tls=True, tls_insecure=True)
+        mock_paho.tls_insecure_set.assert_called_once_with(True)
+
+    def test_credentials_before_tls_warns(self, mock_paho, caplog) -> None:
+        import logging
+
+        client = MagicMock()
+        with caplog.at_level(logging.WARNING, logger="julabo_control.mqtt_bridge"):
+            MQTTBridge(client, "mqtt.local", username="u", password="p")
+        assert "cleartext" in caplog.text
+        mock_paho.tls_set.assert_not_called()
+
+    def test_credentials_with_tls_no_warning(self, mock_paho, caplog) -> None:
+        import logging
+
+        client = MagicMock()
+        with caplog.at_level(logging.WARNING, logger="julabo_control.mqtt_bridge"):
+            MQTTBridge(client, "mqtt.local", username="u", password="p", tls=True)
+        assert "cleartext" not in caplog.text
+        mock_paho.tls_set.assert_called_once()
+        mock_paho.username_pw_set.assert_called_once_with("u", "p")
+
     def test_unknown_topic_logged_as_warning(self, mock_paho, caplog) -> None:
         import logging
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
+import ssl
 from typing import Any
 
 from .core import ChillerBackend, JulaboError
@@ -14,6 +16,7 @@ from .remote_server import (
     MAX_MESSAGE_SIZE,
     PROTOCOL_VERSION,
     _RateLimiter,
+    _sanitize_error,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -34,6 +37,7 @@ class AsyncJulaboServer:
         auth_token: str | None = None,
         rate_limit: int = 0,
         read_only: bool = False,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self._chiller = chiller
         self._host = host
@@ -44,6 +48,7 @@ class AsyncJulaboServer:
             _RateLimiter(max_requests=rate_limit) if rate_limit > 0 else None
         )
         self._read_only = read_only
+        self._ssl_context = ssl_context
         self._server: asyncio.AbstractServer | None = None
 
     # -- public interface ---------------------------------------------------
@@ -52,6 +57,10 @@ class AsyncJulaboServer:
         """Start accepting connections."""
         self._server = await asyncio.start_server(
             self._handle_client, self._host, self._port,
+            # Match the sync server's 1 MB cap; without this the StreamReader
+            # defaults to a 64 KB buffer and rejects legitimate large payloads.
+            limit=MAX_MESSAGE_SIZE,
+            ssl=self._ssl_context,
         )
         addrs = ", ".join(str(s.getsockname()) for s in self._server.sockets)
         LOGGER.info("Async server listening on %s", addrs)
@@ -88,40 +97,40 @@ class AsyncJulaboServer:
         LOGGER.debug("Connection from %s", client_ip)
         try:
             while True:
+                oversized = False
                 try:
                     raw = await reader.readuntil(b"\n")
                 except asyncio.LimitOverrunError:
-                    # Discard the oversized data and send error
-                    buf = await reader.read(MAX_MESSAGE_SIZE + 1)  # noqa: F841
-                    resp = {"status": "error", "error": "Message too large"}
-                    writer.write(json.dumps(resp).encode() + b"\n")
-                    await writer.drain()
-                    continue
+                    oversized = True
+                    raw = b""
+                    await self._drain_to_newline(reader)
                 except (asyncio.IncompleteReadError, ConnectionError):
                     break
-                if len(raw) > MAX_MESSAGE_SIZE:
-                    resp = {"status": "error", "error": "Message too large"}
-                    writer.write(json.dumps(resp).encode() + b"\n")
-                    await writer.drain()
-                    continue
-                line = raw.strip()
-                if not line:
-                    continue
+                if not oversized and len(raw) > MAX_MESSAGE_SIZE:
+                    oversized = True
 
+                # Count every received line against the rate limiter first —
+                # including oversized ones — so a flood cannot bypass the limit.
                 if (
                     self._rate_limiter is not None
                     and not self._rate_limiter.allow(client_ip)
                 ):
                     resp = {"status": "error", "error": "Rate limit exceeded"}
+                elif oversized:
+                    resp = {"status": "error", "error": "Message too large"}
+                    LOGGER.warning("Oversized message from %s", client_ip)
                 else:
+                    line = raw.strip()
+                    if not line:
+                        continue
                     try:
                         message = json.loads(line.decode())
                         resp = await self._process_command(message, client_ip)
                     except (
-                        json.JSONDecodeError, ValueError, TypeError,
+                        json.JSONDecodeError, ValueError, TypeError, AttributeError,
                         PermissionError, JulaboError, TimeoutError,
                     ) as exc:
-                        resp = {"status": "error", "error": str(exc)}
+                        resp = {"status": "error", "error": _sanitize_error(exc)}
 
                 writer.write(json.dumps(resp).encode() + b"\n")
                 await writer.drain()
@@ -132,14 +141,40 @@ class AsyncJulaboServer:
             except Exception:
                 pass
 
+    @staticmethod
+    async def _drain_to_newline(reader: asyncio.StreamReader) -> None:
+        """Discard an over-long line to resync framing after LimitOverrunError.
+
+        ``LimitOverrunError`` leaves the data in the buffer, so read and discard
+        in bounded chunks until a newline (or EOF) is reached.
+        """
+        drained = 0
+        cap = MAX_MESSAGE_SIZE * 8
+        while drained < cap:
+            try:
+                chunk = await reader.read(65536)
+            except (asyncio.IncompleteReadError, ConnectionError):
+                return
+            if not chunk:
+                return  # EOF
+            drained += len(chunk)
+            if b"\n" in chunk:
+                return
+
     # -- command dispatch ---------------------------------------------------
 
     async def _process_command(
         self, message: dict[str, Any], client_ip: str = "",
     ) -> dict[str, Any]:
+        if not isinstance(message, dict):
+            raise ValueError("Request payload must be a JSON object")
+
         if self._auth_token is not None:
             token = message.get("token")
-            if token != self._auth_token:
+            # Constant-time comparison to avoid a timing side-channel.
+            if not isinstance(token, str) or not hmac.compare_digest(
+                token, self._auth_token
+            ):
                 raise PermissionError("Invalid or missing authentication token")
 
         command = message.get("command")
@@ -173,6 +208,8 @@ def main() -> None:  # pragma: no cover - CLI helper
     parser.add_argument("--auth-token", default=None)
     parser.add_argument("--rate-limit", type=int, default=0)
     parser.add_argument("--read-only", action="store_true", default=False)
+    parser.add_argument("--tls-cert", default=None, help="Path to TLS certificate (PEM)")
+    parser.add_argument("--tls-key", default=None, help="Path to TLS private key (PEM)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -180,6 +217,13 @@ def main() -> None:  # pragma: no cover - CLI helper
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    ssl_context: ssl.SSLContext | None = None
+    if args.tls_cert:
+        if not args.tls_key:
+            parser.error("--tls-cert requires --tls-key")
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(args.tls_cert, args.tls_key)
 
     from .core import JulaboChiller, SerialSettings, auto_detect_port
 
@@ -192,6 +236,7 @@ def main() -> None:  # pragma: no cover - CLI helper
         auth_token=args.auth_token,
         rate_limit=args.rate_limit,
         read_only=args.read_only,
+        ssl_context=ssl_context,
     )
 
     try:

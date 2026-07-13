@@ -62,7 +62,7 @@ class TestTemperatureHistoryPlot:
 
         with open(csv_path) as f:
             lines = f.readlines()
-        assert lines[0].strip() == "timestamp_utc,elapsed_minutes,temperature_c"
+        assert lines[0].strip() == "timestamp_utc,elapsed_minutes_buffer,temperature_c"
         assert len(lines) == 3  # header + 2 data rows
 
     def test_history_property(self) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -158,34 +159,45 @@ class ScheduleRunner:
         self.schedule = schedule
         self._apply = apply_setpoint
         self._tolerance = tolerance
+        # Monotonic reference so NTP corrections / manual clock changes cannot
+        # make the ramp jump forward (to the final setpoint) or stall.
         self._start_time: float | None = None
         self._last_setpoint: float | None = None
         self._finished = False
+        self._lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
-        return self._start_time is not None and not self._finished
+        with self._lock:
+            return self._start_time is not None and not self._finished
 
     @property
     def is_finished(self) -> bool:
-        return self._finished
+        with self._lock:
+            return self._finished
 
     @property
     def elapsed_minutes(self) -> float:
+        with self._lock:
+            return self._elapsed_minutes_locked()
+
+    def _elapsed_minutes_locked(self) -> float:
         if self._start_time is None:
             return 0.0
-        return (time.time() - self._start_time) / 60.0
+        return (time.monotonic() - self._start_time) / 60.0
 
     def start(self) -> None:
         """Begin executing the schedule from the current moment."""
-        self._start_time = time.time()
-        self._finished = False
-        self._last_setpoint = None
+        with self._lock:
+            self._start_time = time.monotonic()
+            self._finished = False
+            self._last_setpoint = None
         LOGGER.info("Schedule started (%d steps)", len(self.schedule.steps))
 
     def stop(self) -> None:
         """Stop the schedule execution."""
-        self._finished = True
+        with self._lock:
+            self._finished = True
         LOGGER.info("Schedule stopped")
 
     def tick(self) -> float | None:
@@ -194,24 +206,32 @@ class ScheduleRunner:
         Returns the interpolated setpoint, or ``None`` if the schedule is not
         running.
         """
-        if self._start_time is None or self._finished:
-            return None
+        with self._lock:
+            if self._start_time is None or self._finished:
+                return None
 
-        elapsed = self.elapsed_minutes
-        target = self.schedule.setpoint_at(elapsed)
-
-        if elapsed >= self.schedule.steps[-1].elapsed_minutes:
-            # Apply the final setpoint and mark as finished
-            if self._last_setpoint is None or abs(target - self._last_setpoint) > self._tolerance:
-                self._apply(target)
+            elapsed = self._elapsed_minutes_locked()
+            target = self.schedule.setpoint_at(elapsed)
+            is_final = elapsed >= self.schedule.steps[-1].elapsed_minutes
+            should_apply = (
+                self._last_setpoint is None
+                or abs(target - self._last_setpoint) > self._tolerance
+            )
+            # Mark finished before releasing the lock so a concurrent ``tick``
+            # cannot apply a second (post-completion) setpoint even if the
+            # ``_apply`` callback below raises.
+            if is_final:
+                self._finished = True
+            if should_apply:
                 self._last_setpoint = target
-            self._finished = True
-            LOGGER.info("Schedule finished")
-            return target
 
-        if self._last_setpoint is None or abs(target - self._last_setpoint) > self._tolerance:
+        if should_apply:
             self._apply(target)
-            self._last_setpoint = target
-            LOGGER.debug("Schedule setpoint: %.2f °C at %.1f min", target, elapsed)
+            if is_final:
+                LOGGER.info("Schedule finished")
+            else:
+                LOGGER.debug("Schedule setpoint: %.2f °C at %.1f min", target, elapsed)
+        elif is_final:
+            LOGGER.info("Schedule finished")
 
         return target

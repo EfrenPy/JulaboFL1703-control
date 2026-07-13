@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hmac
 import json
 import logging
 import os
@@ -34,6 +35,10 @@ LOGGER = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 2
 MAX_MESSAGE_SIZE = 1_048_576  # 1 MB
+
+# Time budget for completing the TLS handshake on an accepted connection.
+# Bounds a slow-loris style attack that never finishes the ClientHello.
+TLS_HANDSHAKE_TIMEOUT = 10.0
 
 INITIAL_RETRY_DELAY = 5.0
 MAX_RETRY_DELAY = 60.0
@@ -212,18 +217,38 @@ class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             self._active_connections -= 1
 
     def get_request(self) -> tuple[Any, Any]:
-        """Optionally wrap accepted connections with TLS."""
+        """Optionally wrap accepted connections with TLS.
+
+        The handshake runs in the acceptor thread, so a client that never
+        completes it would otherwise block every future ``accept()``.  Bound it
+        with a timeout and close the raw socket if wrapping fails.
+        """
         conn, addr = super().get_request()
         if self._ssl_context is not None:
-            conn = self._ssl_context.wrap_socket(conn, server_side=True)
+            conn.settimeout(TLS_HANDSHAKE_TIMEOUT)
+            try:
+                conn = self._ssl_context.wrap_socket(conn, server_side=True)
+            except (OSError, ssl.SSLError):
+                conn.close()
+                raise
+            # Reset to blocking for the request handler, which sets its own
+            # idle timeout during setup.
+            conn.settimeout(None)
         return conn, addr
 
     def process_command(
         self, message: dict[str, Any], client_ip: str = ""
     ) -> dict[str, Any]:
+        if not isinstance(message, dict):
+            raise ValueError("Request payload must be a JSON object")
+
         if self.auth_token is not None:
             token = message.get("token")
-            if token != self.auth_token:
+            # Constant-time comparison to avoid leaking the token byte-by-byte
+            # via response timing.
+            if not isinstance(token, str) or not hmac.compare_digest(
+                token, self.auth_token
+            ):
                 raise PermissionError("Invalid or missing authentication token")
 
         command = message.get("command")
@@ -248,8 +273,11 @@ class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                 self._metrics.record_command(command, _elapsed)
             return {"status": "ok", "result": "pong", "protocol_version": PROTOCOL_VERSION}
 
-        # Serial disconnected — block everything except ping (handled above)
-        if not self._serial_connected:
+        # Serial disconnected — block everything except ping (handled above).
+        # Read under the lock for consistency with the watchdog's writes.
+        with self._lock:
+            serial_connected = self._serial_connected
+        if not serial_connected:
             return {
                 "status": "error",
                 "error": "Serial connection lost, reconnecting...",
@@ -339,26 +367,34 @@ class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
     def _schedule_ticker(self, chiller_id: str) -> None:
         """Background thread that ticks the schedule runner for a specific chiller."""
-        while True:
+        try:
+            while True:
+                with self._schedule_lock:
+                    runner = self._schedule_runners.get(chiller_id)
+                if runner is None or not runner.is_running:
+                    return
+                try:
+                    runner.tick()
+                except Exception as exc:
+                    LOGGER.error("Schedule tick error for %s: %s", chiller_id, exc)
+                    with self._schedule_lock:
+                        if self._schedule_runners.get(chiller_id) is runner:
+                            runner.stop()
+                            del self._schedule_runners[chiller_id]
+                    return
+                if runner.is_finished:
+                    with self._schedule_lock:
+                        if self._schedule_runners.get(chiller_id) is runner:
+                            del self._schedule_runners[chiller_id]
+                    return
+                time.sleep(2.0)
+        finally:
+            # Remove our own thread-table entry so it doesn't accumulate across
+            # many schedule load/stop cycles.
+            current = threading.current_thread()
             with self._schedule_lock:
-                runner = self._schedule_runners.get(chiller_id)
-            if runner is None or not runner.is_running:
-                return
-            try:
-                runner.tick()
-            except Exception as exc:
-                LOGGER.error("Schedule tick error for %s: %s", chiller_id, exc)
-                with self._schedule_lock:
-                    if self._schedule_runners.get(chiller_id) is runner:
-                        runner.stop()
-                        del self._schedule_runners[chiller_id]
-                return
-            if runner.is_finished:
-                with self._schedule_lock:
-                    if self._schedule_runners.get(chiller_id) is runner:
-                        del self._schedule_runners[chiller_id]
-                return
-            time.sleep(2.0)
+                if self._schedule_threads.get(chiller_id) is current:
+                    del self._schedule_threads[chiller_id]
 
     def _load_schedule(
         self, csv_data: str, chiller_id: str = "default"
@@ -377,7 +413,8 @@ class JulaboTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         thread = threading.Thread(
             target=self._schedule_ticker, args=(chiller_id,), daemon=True
         )
-        self._schedule_threads[chiller_id] = thread
+        with self._schedule_lock:
+            self._schedule_threads[chiller_id] = thread
         thread.start()
         return {
             "steps": len(schedule.steps),
@@ -440,28 +477,38 @@ class JulaboRequestHandler(socketserver.StreamRequestHandler):
                 return
             if not raw:
                 break
-            if len(raw) > MAX_MESSAGE_SIZE:
-                response = {"status": "error", "error": "Message too large"}
-                LOGGER.warning("Oversized message from %s (%d bytes)", client_ip, len(raw))
-                data = json.dumps(response).encode("utf-8") + b"\n"
-                self.wfile.write(data)
-                continue
-            raw = raw.strip()
-            if not raw:
-                continue
 
+            oversized = len(raw) > MAX_MESSAGE_SIZE
+
+            # Count every received line against the rate limiter first — even
+            # oversized ones — so an oversized-message flood cannot bypass the
+            # configured limit.
             if (
                 self.server._rate_limiter is not None
                 and not self.server._rate_limiter.allow(client_ip)
             ):
                 response = {"status": "error", "error": "Rate limit exceeded"}
                 LOGGER.warning("Rate limit exceeded for %s", client_ip)
+                if oversized and not self._drain_to_newline():
+                    # Could not resync the stream — drop the connection.
+                    self._write_response(client_ip, raw, response)
+                    return
+            elif oversized:
+                response = {"status": "error", "error": "Message too large"}
+                LOGGER.warning("Oversized message from %s (%d bytes)", client_ip, len(raw))
+                if not self._drain_to_newline():
+                    self._write_response(client_ip, raw, response)
+                    return
             else:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                raw = stripped
                 try:
                     message = json.loads(raw.decode("utf-8"))
                     response = self.server.process_command(message, client_ip=client_ip)
                 except (
-                    json.JSONDecodeError, ValueError, TypeError,
+                    json.JSONDecodeError, ValueError, TypeError, AttributeError,
                     PermissionError, JulaboError, TimeoutError,
                     serial.SerialException,
                 ) as exc:
@@ -471,16 +518,41 @@ class JulaboRequestHandler(socketserver.StreamRequestHandler):
                     if self.server._metrics is not None:
                         self.server._metrics.record_error(type(exc).__name__)
 
-            if self.server._traffic_logger is not None:
-                self.server._traffic_logger.debug(
-                    "REQ %s %s", client_ip, raw.decode("utf-8", errors="replace")
-                )
-                self.server._traffic_logger.debug(
-                    "RES %s %s", client_ip, json.dumps(response)
-                )
+            self._write_response(client_ip, raw, response)
 
-            data = json.dumps(response).encode("utf-8") + b"\n"
-            self.wfile.write(data)
+    def _drain_to_newline(self) -> bool:  # pragma: no cover - network
+        """Discard the remainder of an over-long line to resync framing.
+
+        Returns ``True`` once a newline (or EOF) is reached, ``False`` if the
+        offending line is so long it isn't worth resyncing (caller should close).
+        """
+        drained = 0
+        limit = MAX_MESSAGE_SIZE * 8
+        while drained < limit:
+            try:
+                chunk = self.rfile.readline(MAX_MESSAGE_SIZE + 1)
+            except OSError:
+                return False
+            if not chunk:
+                return True  # EOF
+            drained += len(chunk)
+            if chunk.endswith(b"\n"):
+                return True
+        return False
+
+    def _write_response(  # pragma: no cover - network
+        self, client_ip: str, raw: bytes, response: dict[str, Any]
+    ) -> None:
+        if self.server._traffic_logger is not None:
+            self.server._traffic_logger.debug(
+                "REQ %s %s", client_ip, raw.decode("utf-8", errors="replace")
+            )
+            self.server._traffic_logger.debug(
+                "RES %s %s", client_ip, json.dumps(response)
+            )
+
+        data = json.dumps(response).encode("utf-8") + b"\n"
+        self.wfile.write(data)
 
 
 _HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
@@ -782,6 +854,14 @@ def parse_arguments() -> argparse.Namespace:
         help="Port for Prometheus metrics HTTP endpoint (disabled if omitted)",
     )
     parser.add_argument(
+        "--metrics-host",
+        default="127.0.0.1",
+        help=(
+            "Bind address for the metrics endpoint (default: 127.0.0.1, "
+            "localhost only). Use 0.0.0.0 to expose it on all interfaces."
+        ),
+    )
+    parser.add_argument(
         "--log-format",
         choices=["text", "json"],
         default=None,
@@ -987,10 +1067,11 @@ def _create_server(
         or int(server_cfg.get("metrics_port", "0"))
     )
     if metrics_port:
-        metrics_srv = _MetricsHTTPServer(("", metrics_port), server._metrics)
+        metrics_host = getattr(args, "metrics_host", "127.0.0.1") or "127.0.0.1"
+        metrics_srv = _MetricsHTTPServer((metrics_host, metrics_port), server._metrics)
         server._metrics_server = metrics_srv
         metrics_srv.start()
-        LOGGER.info("Metrics HTTP server on port %d", metrics_port)
+        LOGGER.info("Metrics HTTP server on %s:%d", metrics_host, metrics_port)
 
     LOGGER.info("Listening on %s:%s", host, port)
     if auth_token:
